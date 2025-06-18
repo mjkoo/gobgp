@@ -19,6 +19,6 @@ go get github.com/AdamKorcz/go-118-fuzz-build/testing
 
 sed -i '/func BenchmarkNormalizeFlowSpecOpValues(/,/^}/ s/^/\/\//' pkg/packet/bgp/bgp_test.go
 
-export CXXFLAGS="$CXXFLAGS -lpthread"
+export CXXFLAGS="$CXXFLAGS -fsanitize=address -lpthread"
 
 compile_native_go_fuzzer $PWD/pkg/packet/bgp           FuzzParseBGPMessage         fuzz_parse_bgp_message
