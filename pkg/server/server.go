@@ -24,6 +24,7 @@ import (
 	"net/netip"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -32,16 +33,18 @@ import (
 	"github.com/eapache/channels"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
-	api "github.com/osrg/gobgp/v3/api"
-	"github.com/osrg/gobgp/v3/internal/pkg/table"
-	"github.com/osrg/gobgp/v3/internal/pkg/version"
-	"github.com/osrg/gobgp/v3/pkg/apiutil"
-	"github.com/osrg/gobgp/v3/pkg/config/oc"
-	"github.com/osrg/gobgp/v3/pkg/log"
-	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
-	"github.com/osrg/gobgp/v3/pkg/packet/bmp"
-	"github.com/osrg/gobgp/v3/pkg/zebra"
+	"github.com/osrg/gobgp/v4/api"
+	"github.com/osrg/gobgp/v4/internal/pkg/table"
+	"github.com/osrg/gobgp/v4/internal/pkg/version"
+	"github.com/osrg/gobgp/v4/pkg/apiutil"
+	"github.com/osrg/gobgp/v4/pkg/config/oc"
+	"github.com/osrg/gobgp/v4/pkg/log"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
+	"github.com/osrg/gobgp/v4/pkg/packet/bmp"
+	"github.com/osrg/gobgp/v4/pkg/zebra"
 )
 
 type FSMOperation uint
@@ -143,6 +146,19 @@ func newTCPListener(logger log.Logger, address string, port uint32, bindToDev st
 				}
 				return err
 			}
+
+			err = conn.SetKeepAlive(false)
+			if err != nil {
+				conn.Close()
+				close(closeCh)
+				logger.Warn("Failed to SetKeepAlive",
+					log.Fields{
+						"Topic": "Peer",
+						"Key":   addr,
+						"Error": err})
+				return err
+			}
+
 			select {
 			case ch <- conn:
 			case <-listenerCtx.Done():
@@ -591,7 +607,7 @@ func filterpath(peer *peer, path, old *table.Path) *table.Path {
 	}
 
 	peer.fsm.lock.RLock()
-	_, ok := peer.fsm.rfMap[path.GetRouteFamily()]
+	_, ok := peer.fsm.rfMap[path.GetFamily()]
 	peer.fsm.lock.RUnlock()
 	if !ok {
 		return nil
@@ -601,10 +617,10 @@ func filterpath(peer *peer, path, old *table.Path) *table.Path {
 	peer.fsm.lock.RLock()
 	_, y := peer.fsm.rfMap[bgp.RF_RTC_UC]
 	peer.fsm.lock.RUnlock()
-	if y && path.GetRouteFamily() != bgp.RF_RTC_UC {
+	if y && path.GetFamily() != bgp.RF_RTC_UC {
 		ignore := true
 		for _, ext := range path.GetExtCommunities() {
-			for _, p := range peer.adjRibIn.PathList([]bgp.RouteFamily{bgp.RF_RTC_UC}, true) {
+			for _, p := range peer.adjRibIn.PathList([]bgp.Family{bgp.RF_RTC_UC}, true) {
 				rt := p.GetNlri().(*bgp.RouteTargetMembershipNLRI).RouteTarget
 				// Note: nil RT means the default route target
 				if rt == nil || ext.String() == rt.String() {
@@ -691,15 +707,22 @@ func filterpath(peer *peer, path, old *table.Path) *table.Path {
 		return nil
 	}
 
-	if !peer.isRouteServerClient() && isASLoop(peer, path) && !path.IsLocal() {
-		return nil
+	if !peer.isRouteServerClient() && isASLoop(peer, path) {
+		// Do not filter local (static) routes with as-path loop
+		// if configured to bypass these checks in the peer
+		// as-path options config.
+		if path.IsLocal() && !peer.allowAsPathLoopLocal() {
+			return nil
+		} else if !path.IsLocal() {
+			return nil
+		}
 	}
 	return path
 }
 
 func (s *BgpServer) prePolicyFilterpath(peer *peer, path, old *table.Path) (*table.Path, *table.PolicyOptions, bool) {
 	// Special handling for RTM NLRI.
-	if path != nil && path.GetRouteFamily() == bgp.RF_RTC_UC && !path.IsWithdraw {
+	if path != nil && path.GetFamily() == bgp.RF_RTC_UC && !path.IsWithdraw {
 		// If the given "path" is locally generated and the same with "old", we
 		// assumes "path" was already sent before. This assumption avoids the
 		// infinite UPDATE loop between Route Reflector and its clients.
@@ -715,8 +738,10 @@ func (s *BgpServer) prePolicyFilterpath(peer *peer, path, old *table.Path) (*tab
 		}
 
 		if old != nil && old.IsLocal() {
-			// We assumes VRF with the specific RT is deleted.
-			path = old.Clone(true)
+			// If it is vrf or rtc route deleting, it will work via explicitWithdraw
+			// and make old.Clone(true). The only way to get path != nil and old != nil
+			// is to change the path without changing rt. Then we need to update path or
+			// do nothing if path == old.
 		} else if peer.isRouteReflectorClient() {
 			// We need to send the path even if the peer is originator of the
 			// path in order to signal that the client should distribute route
@@ -750,7 +775,7 @@ func (s *BgpServer) prePolicyFilterpath(peer *peer, path, old *table.Path) (*tab
 	peerVrf := peer.fsm.pConf.Config.Vrf
 	peer.fsm.lock.RUnlock()
 	if path != nil && peerVrf != "" {
-		if f := path.GetRouteFamily(); f != bgp.RF_IPv4_VPN && f != bgp.RF_IPv6_VPN && f != bgp.RF_FS_IPv4_VPN && f != bgp.RF_FS_IPv6_VPN {
+		if f := path.GetFamily(); f != bgp.RF_IPv4_VPN && f != bgp.RF_IPv6_VPN && f != bgp.RF_FS_IPv4_VPN && f != bgp.RF_FS_IPv6_VPN {
 			return nil, nil, true
 		}
 		vrf := peer.localRib.Vrfs[peerVrf]
@@ -774,8 +799,17 @@ func (s *BgpServer) prePolicyFilterpath(peer *peer, path, old *table.Path) (*tab
 
 	peer.fsm.lock.RLock()
 	options := &table.PolicyOptions{
-		Info:       peer.fsm.peerInfo,
-		OldNextHop: path.GetNexthop(),
+		Info: peer.fsm.peerInfo,
+	}
+	if path.IsLocal() && path.GetNexthop().IsUnspecified() {
+		// We need a special treatment for the locally-originated path
+		// with unspecified nexthop (0.0.0.0 or ::). In this case, the
+		// OldNextHop option should be set to the local address.
+		// Otherwise, we advertise the unspecified nexthop as is when
+		// nexthop-unchanged is configured.
+		options.OldNextHop = peer.fsm.peerInfo.LocalAddress
+	} else {
+		options.OldNextHop = path.GetNexthop()
 	}
 	path = table.UpdatePathAttrs(peer.fsm.logger, peer.fsm.gConf, peer.fsm.pConf, peer.fsm.peerInfo, path)
 	peer.fsm.lock.RUnlock()
@@ -792,7 +826,7 @@ func (s *BgpServer) postFilterpath(peer *peer, path *table.Path) *table.Path {
 	// exception is described in the Optional Partial Deployment
 	// Procedure section (Section 4.7).  Note that this requirement
 	// implies that such routes should be withdrawn from any such neighbor.
-	if path != nil && !path.IsWithdraw && !peer.isLLGREnabledFamily(path.GetRouteFamily()) && path.IsLLGRStale() {
+	if path != nil && !path.IsWithdraw && !peer.isLLGREnabledFamily(path.GetFamily()) && path.IsLLGRStale() {
 		// we send unnecessary withdrawn even if we didn't
 		// sent the route.
 		path = path.Clone(true)
@@ -839,7 +873,7 @@ func clonePathList(pathList []*table.Path) []*table.Path {
 
 func (s *BgpServer) setPathVrfIdMap(paths []*table.Path, m map[uint32]bool) {
 	for _, p := range paths {
-		switch p.GetRouteFamily() {
+		switch p.GetFamily() {
 		case bgp.RF_IPv4_VPN, bgp.RF_IPv6_VPN:
 			for _, vrf := range s.globalRib.Vrfs {
 				if vrf.Id != 0 && table.CanImportToVrf(vrf, p) {
@@ -1009,6 +1043,22 @@ func newWatchEventPeer(peer *peer, m *fsmMsg, oldState bgp.FSMState, t PeerEvent
 		_, rport = peer.fsm.RemoteHostPort()
 		laddr, lport = peer.fsm.LocalHostPort()
 	}
+
+	remoteCaps := make([]*api.Capability, 0)
+	if peer.fsm.state >= bgp.BGP_FSM_OPENCONFIRM {
+		// Adding peer remote capabilities to the event
+		capList := make([]bgp.ParameterCapabilityInterface, 0, len(peer.fsm.capMap))
+		for code, caps := range peer.fsm.capMap {
+			if code == bgp.BGP_CAP_FQDN {
+				// skip FQDN capability as it generates errors when Marshalling
+				continue
+			}
+			capList = append(capList, caps...)
+		}
+		if foundCaps, err := apiutil.MarshalCapabilities(capList); err == nil {
+			remoteCaps = foundCaps
+		}
+	}
 	recvOpen := peer.fsm.recvOpen
 	e := &watchEventPeer{
 		Type:          t,
@@ -1026,6 +1076,7 @@ func newWatchEventPeer(peer *peer, m *fsmMsg, oldState bgp.FSMState, t PeerEvent
 		AdminState:    peer.fsm.adminState,
 		Timestamp:     time.Now(),
 		PeerInterface: peer.fsm.pConf.Config.NeighborInterface,
+		RemoteCap:     remoteCaps,
 	}
 	peer.fsm.lock.RUnlock()
 
@@ -1068,14 +1119,14 @@ func (s *BgpServer) notifyRecvMessageWatcher(peer *peer, timestamp time.Time, ms
 	s.notifyMessageWatcher(peer, timestamp, msg, false)
 }
 
-func (s *BgpServer) getPossibleBest(peer *peer, family bgp.RouteFamily) []*table.Path {
+func (s *BgpServer) getPossibleBest(peer *peer, family bgp.Family) []*table.Path {
 	if peer.isAddPathSendEnabled(family) {
-		return peer.localRib.GetPathList(peer.TableID(), peer.AS(), []bgp.RouteFamily{family})
+		return peer.localRib.GetPathList(peer.TableID(), peer.AS(), []bgp.Family{family})
 	}
-	return peer.localRib.GetBestPathList(peer.TableID(), peer.AS(), []bgp.RouteFamily{family})
+	return peer.localRib.GetBestPathList(peer.TableID(), peer.AS(), []bgp.Family{family})
 }
 
-func (s *BgpServer) getBestFromLocal(peer *peer, rfList []bgp.RouteFamily) ([]*table.Path, []*table.Path) {
+func (s *BgpServer) getBestFromLocal(peer *peer, rfList []bgp.Family) ([]*table.Path, []*table.Path) {
 	pathList := []*table.Path{}
 	filtered := []*table.Path{}
 
@@ -1202,7 +1253,7 @@ func (s *BgpServer) processOutgoingPaths(peer *peer, paths, olds []*table.Path) 
 func (s *BgpServer) handleRouteRefresh(peer *peer, e *fsmMsg) []*table.Path {
 	m := e.MsgData.(*bgp.BGPMessage)
 	rr := m.Body.(*bgp.BGPRouteRefresh)
-	rf := bgp.AfiSafiToRouteFamily(rr.AFI, rr.SAFI)
+	rf := bgp.AfiSafiToFamily(rr.AFI, rr.SAFI)
 
 	peer.fsm.lock.RLock()
 	_, ok := peer.fsm.rfMap[rf]
@@ -1226,7 +1277,7 @@ func (s *BgpServer) handleRouteRefresh(peer *peer, e *fsmMsg) []*table.Path {
 				"Key":   peer.ID()})
 		return nil
 	}
-	rfList := []bgp.RouteFamily{rf}
+	rfList := []bgp.Family{rf}
 	accepted, _ := s.getBestFromLocal(peer, rfList)
 	return accepted
 }
@@ -1288,9 +1339,9 @@ func (s *BgpServer) propagateUpdate(peer *peer, pathList []*table.Path) {
 			// updates (advertisements and/or withdraws) necessary to transition
 			// between the previous and current state of the route distribution
 			// graph that is derived from Route Target membership information.
-			if peer != nil && path != nil && path.GetRouteFamily() == bgp.RF_RTC_UC {
+			if peer != nil && path != nil && path.GetFamily() == bgp.RF_RTC_UC {
 				rt := path.GetNlri().(*bgp.RouteTargetMembershipNLRI).RouteTarget
-				fs := make([]bgp.RouteFamily, 0, len(peer.negotiatedRFList()))
+				fs := make([]bgp.Family, 0, len(peer.negotiatedRFList()))
 				for _, f := range peer.negotiatedRFList() {
 					if f != bgp.RF_RTC_UC {
 						fs = append(fs, f)
@@ -1304,10 +1355,17 @@ func (s *BgpServer) propagateUpdate(peer *peer, pathList []*table.Path) {
 				} else {
 					// https://github.com/osrg/gobgp/issues/1777
 					// Ignore duplicate Membership announcements
-					membershipsForSource := s.globalRib.GetPathListWithSource(table.GLOBAL_RIB_NAME, []bgp.RouteFamily{bgp.RF_RTC_UC}, path.GetSource())
+					membershipsForSource := s.globalRib.GetPathListWithSource(table.GLOBAL_RIB_NAME, []bgp.Family{bgp.RF_RTC_UC}, path.GetSource())
 					found := false
+					equalRT := func(a, b bgp.ExtendedCommunityInterface) bool {
+						if a == nil && b == nil {
+							return true
+						}
+						return a != nil && b != nil && a.String() == b.String()
+					}
 					for _, membership := range membershipsForSource {
-						if membership.GetNlri().(*bgp.RouteTargetMembershipNLRI).RouteTarget.String() == rt.String() {
+						mrt := membership.GetNlri().(*bgp.RouteTargetMembershipNLRI).RouteTarget
+						if equalRT(mrt, rt) {
 							found = true
 							break
 						}
@@ -1370,12 +1428,12 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 		gBestList, gOldList, mpathList = dstsToPaths(table.GLOBAL_RIB_NAME, 0, dsts)
 		s.notifyBestWatcher(gBestList, mpathList)
 	}
-	family := newPath.GetRouteFamily()
+	family := newPath.GetFamily()
 	for _, targetPeer := range s.neighborMap {
 		if (source == nil && targetPeer.isRouteServerClient()) || (source != nil && source.isRouteServerClient() != targetPeer.isRouteServerClient()) {
 			continue
 		}
-		f := func() bgp.RouteFamily {
+		f := func() bgp.Family {
 			targetPeer.fsm.lock.RLock()
 			peerVrf := targetPeer.fsm.pConf.Config.Vrf
 			targetPeer.fsm.lock.RUnlock()
@@ -1457,7 +1515,7 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 					if !alreadySent {
 						targetPeer.updateRoutes(newPath)
 					}
-					if newPath.GetRouteFamily() == bgp.RF_RTC_UC {
+					if newPath.GetFamily() == bgp.RF_RTC_UC {
 						// we assumes that new "path" nlri was already sent before. This assumption avoids the
 						// infinite UPDATE loop between Route Reflector and its clients.
 						for _, old := range dsts[0].OldKnownPathList {
@@ -1539,12 +1597,12 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 			}
 			graceful := peer.fsm.reason.Type == fsmGracefulRestart
 			peer.fsm.lock.Unlock()
-			var drop []bgp.RouteFamily
+			var drop []bgp.Family
 			if graceful {
 				peer.fsm.lock.Lock()
 				peer.fsm.pConf.GracefulRestart.State.PeerRestarting = true
 				peer.fsm.lock.Unlock()
-				var p []bgp.RouteFamily
+				var p []bgp.Family
 				p, drop = peer.forwardingPreservedFamilies()
 				s.propagateUpdate(peer, peer.StaleAll(p))
 			} else {
@@ -1558,7 +1616,7 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 			}
 			peer.fsm.lock.Unlock()
 
-			peer.prefixLimitWarned = make(map[bgp.RouteFamily]bool)
+			peer.prefixLimitWarned = make(map[bgp.Family]bool)
 			s.propagateUpdate(peer, peer.DropAll(drop))
 
 			peer.fsm.lock.Lock()
@@ -1576,8 +1634,15 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 		} else if nextStateIdle {
 			peer.fsm.lock.RLock()
 			longLivedEnabled := peer.fsm.pConf.GracefulRestart.State.LongLivedEnabled
+			longLivedRunning := peer.fsm.longLivedRunning
 			peer.fsm.lock.RUnlock()
-			if longLivedEnabled {
+			// We must not restart LLGR timer until we have syncronized with
+			// the peer. Routes also need to be marked wit LLGR comm just once.
+			// https://datatracker.ietf.org/doc/html/rfc9494#session_resetsnever
+			if longLivedEnabled && !longLivedRunning {
+				peer.fsm.lock.Lock()
+				peer.fsm.longLivedRunning = true
+				peer.fsm.lock.Unlock()
 				llgr, no_llgr := peer.llgrFamilies()
 
 				s.propagateUpdate(peer, peer.DropAll(no_llgr))
@@ -1595,7 +1660,7 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 				for _, f := range llgr {
 					endCh := make(chan struct{})
 					peer.llgrEndChs = append(peer.llgrEndChs, endCh)
-					go func(family bgp.RouteFamily, endCh chan struct{}) {
+					go func(family bgp.Family, endCh chan struct{}) {
 						t := peer.llgrRestartTime(family)
 						timer := time.NewTimer(time.Second * time.Duration(t))
 
@@ -1616,7 +1681,7 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 										"Family":   family,
 										"Duration": t})
 
-								s.propagateUpdate(peer, peer.DropAll([]bgp.RouteFamily{family}))
+								s.propagateUpdate(peer, peer.DropAll([]bgp.Family{family}))
 
 								// when all llgr restart timer expired, stop PeerRestarting
 								if peer.llgrRestartTimerExpired(family) {
@@ -1634,7 +1699,7 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 						}
 					}(f, endCh)
 				}
-			} else {
+			} else if !longLivedEnabled {
 				// RFC 4724 4.2
 				// If the session does not get re-established within the "Restart Time"
 				// that the peer advertised previously, the Receiving Speaker MUST
@@ -1664,12 +1729,20 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 			ipaddr, _ := net.ResolveIPAddr("ip", laddr)
 			peer.fsm.peerInfo.LocalAddress = ipaddr.IP
 			if peer.fsm.pConf.Transport.Config.LocalAddress != netip.IPv4Unspecified().String() && peer.fsm.pConf.Transport.Config.LocalAddress != netip.IPv6Unspecified().String() {
-				peer.fsm.peerInfo.LocalAddress = net.ParseIP(peer.fsm.pConf.Transport.Config.LocalAddress)
-				peer.fsm.pConf.Transport.State.LocalAddress = peer.fsm.pConf.Transport.Config.LocalAddress
+				// Exclude zone info for v6 address like "fe80::1ff:fe23:4567:890a%eth2".
+				p := peer.fsm.pConf.Transport.Config.LocalAddress
+				if i := strings.IndexByte(p, '%'); i != -1 {
+					p = p[:i]
+				}
+				laddr := net.ParseIP(p)
+
+				peer.fsm.peerInfo.LocalAddress = laddr
+				peer.fsm.pConf.Transport.State.LocalAddress = laddr.String()
 			}
+
 			neighborAddress := peer.fsm.pConf.State.NeighborAddress
 			peer.fsm.lock.Unlock()
-			deferralExpiredFunc := func(family bgp.RouteFamily) func() {
+			deferralExpiredFunc := func(family bgp.Family) func() {
 				return func() {
 					s.mgmtOperation(func() error {
 						s.softResetOut(neighborAddress, family, true)
@@ -1697,7 +1770,7 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 				notPeerRestarting := !peer.fsm.pConf.GracefulRestart.State.PeerRestarting
 				peer.fsm.lock.RUnlock()
 				if y && notPeerRestarting && c.RouteTargetMembership.Config.DeferralTime > 0 {
-					pathList, _ = s.getBestFromLocal(peer, []bgp.RouteFamily{bgp.RF_RTC_UC})
+					pathList, _ = s.getBestFromLocal(peer, []bgp.Family{bgp.RF_RTC_UC})
 					t := c.RouteTargetMembership.Config.DeferralTime
 					for _, f := range peer.negotiatedRFList() {
 						if f != bgp.RF_RTC_UC {
@@ -1756,7 +1829,7 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 							"Topic":    "Server",
 							"Key":      peer.ID(),
 							"Duration": deferral})
-					time.AfterFunc(time.Second*time.Duration(deferral), deferralExpiredFunc(bgp.RouteFamily(0)))
+					time.AfterFunc(time.Second*time.Duration(deferral), deferralExpiredFunc(bgp.Family(0)))
 				}
 			}
 		} else {
@@ -1923,7 +1996,7 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 						log.Fields{
 							"Topic": "Peer",
 							"Key":   peer.ID()})
-					families := make([]bgp.RouteFamily, 0, len(peer.negotiatedRFList()))
+					families := make([]bgp.Family, 0, len(peer.negotiatedRFList()))
 					for _, f := range peer.negotiatedRFList() {
 						if f != bgp.RF_RTC_UC {
 							families = append(families, f)
@@ -2247,7 +2320,7 @@ func (s *BgpServer) fixupApiPath(vrfId string, pathList []*table.Path) error {
 				// MAC Mobility Extended Community
 				var paths []*table.Path
 				for _, ec := range path.GetRouteTargets() {
-					paths = append(paths, s.globalRib.GetPathListWithMac(table.GLOBAL_RIB_NAME, 0, []bgp.RouteFamily{bgp.RF_EVPN}, ec, r.MacAddress)...)
+					paths = append(paths, s.globalRib.GetPathListWithMac(table.GLOBAL_RIB_NAME, 0, []bgp.Family{bgp.RF_EVPN}, ec, r.MacAddress)...)
 				}
 				if m := getMacMobilityExtendedCommunity(r.ETag, r.MacAddress, paths); m != nil {
 					pm := getMacMobilityExtendedCommunity(r.ETag, r.MacAddress, []*table.Path{path})
@@ -2374,7 +2447,7 @@ func (s *BgpServer) DeletePath(ctx context.Context, r *api.DeletePathRequest) er
 			// Delete all locally generated paths
 			families := s.globalRib.GetRFlist()
 			if r.Family != nil {
-				families = []bgp.RouteFamily{bgp.AfiSafiToRouteFamily(uint16(r.Family.Afi), uint8(r.Family.Safi))}
+				families = []bgp.Family{bgp.AfiSafiToFamily(uint16(r.Family.Afi), uint8(r.Family.Safi))}
 
 			}
 			for _, path := range s.globalRib.GetPathList(table.GLOBAL_RIB_NAME, 0, families) {
@@ -2571,10 +2644,10 @@ func (s *BgpServer) DeleteVrf(ctx context.Context, r *api.DeleteVrfRequest) erro
 	}, true)
 }
 
-func familiesForSoftreset(peer *peer, family bgp.RouteFamily) []bgp.RouteFamily {
-	if family == bgp.RouteFamily(0) {
+func familiesForSoftreset(peer *peer, family bgp.Family) []bgp.Family {
+	if family == bgp.Family(0) {
 		configured := peer.configuredRFlist()
-		families := make([]bgp.RouteFamily, 0, len(configured))
+		families := make([]bgp.Family, 0, len(configured))
 		for _, f := range configured {
 			if f != bgp.RF_RTC_UC {
 				families = append(families, f)
@@ -2582,10 +2655,10 @@ func familiesForSoftreset(peer *peer, family bgp.RouteFamily) []bgp.RouteFamily 
 		}
 		return families
 	}
-	return []bgp.RouteFamily{family}
+	return []bgp.Family{family}
 }
 
-func (s *BgpServer) softResetIn(addr string, family bgp.RouteFamily) error {
+func (s *BgpServer) softResetIn(addr string, family bgp.Family) error {
 	peers, err := s.addrToPeers(addr)
 	if err != nil {
 		return err
@@ -2596,7 +2669,7 @@ func (s *BgpServer) softResetIn(addr string, family bgp.RouteFamily) error {
 	return err
 }
 
-func (s *BgpServer) softResetOut(addr string, family bgp.RouteFamily, deferral bool) error {
+func (s *BgpServer) softResetOut(addr string, family bgp.Family, deferral bool) error {
 	peers, err := s.addrToPeers(addr)
 	if err != nil {
 		return err
@@ -2611,7 +2684,7 @@ func (s *BgpServer) softResetOut(addr string, family bgp.RouteFamily, deferral b
 		families := familiesForSoftreset(peer, family)
 
 		if deferral {
-			if family == bgp.RouteFamily(0) {
+			if family == bgp.Family(0) {
 				families = peer.configuredRFlist()
 			}
 			peer.fsm.lock.RLock()
@@ -2658,7 +2731,7 @@ func (s *BgpServer) softResetOut(addr string, family bgp.RouteFamily, deferral b
 	return nil
 }
 
-func (s *BgpServer) sResetIn(addr string, family bgp.RouteFamily) error {
+func (s *BgpServer) sResetIn(addr string, family bgp.Family) error {
 	s.logger.Info("Neighbor soft reset in",
 		log.Fields{
 			"Topic": "Operation",
@@ -2666,7 +2739,7 @@ func (s *BgpServer) sResetIn(addr string, family bgp.RouteFamily) error {
 	return s.softResetIn(addr, family)
 }
 
-func (s *BgpServer) sResetOut(addr string, family bgp.RouteFamily) error {
+func (s *BgpServer) sResetOut(addr string, family bgp.Family) error {
 	s.logger.Info("Neighbor soft reset out",
 		log.Fields{
 			"Topic": "Operation",
@@ -2674,7 +2747,7 @@ func (s *BgpServer) sResetOut(addr string, family bgp.RouteFamily) error {
 	return s.softResetOut(addr, family, false)
 }
 
-func (s *BgpServer) sReset(addr string, family bgp.RouteFamily) error {
+func (s *BgpServer) sReset(addr string, family bgp.Family) error {
 	s.logger.Info("Neighbor soft reset",
 		log.Fields{
 			"Topic": "Operation",
@@ -2698,7 +2771,7 @@ func (s *BgpServer) validateTable(r *table.Table) (v map[*table.Path]*table.Vali
 	return
 }
 
-func (s *BgpServer) getRib(addr string, family bgp.RouteFamily, prefixes []*table.LookupPrefix) (rib *table.Table, v map[*table.Path]*table.Validation, err error) {
+func (s *BgpServer) getRib(addr string, family bgp.Family, prefixes []*table.LookupPrefix) (rib *table.Table, v map[*table.Path]*table.Validation, err error) {
 	err = s.mgmtOperation(func() error {
 		m := s.globalRib
 		id := table.GLOBAL_RIB_NAME
@@ -2715,7 +2788,7 @@ func (s *BgpServer) getRib(addr string, family bgp.RouteFamily, prefixes []*tabl
 			as = peer.AS()
 			m = s.rsRib
 		}
-		af := bgp.RouteFamily(family)
+		af := bgp.Family(family)
 		tbl, ok := m.Tables[af]
 		if !ok {
 			return fmt.Errorf("address family: %s not supported", af)
@@ -2727,14 +2800,14 @@ func (s *BgpServer) getRib(addr string, family bgp.RouteFamily, prefixes []*tabl
 	return
 }
 
-func (s *BgpServer) getVrfRib(name string, family bgp.RouteFamily, prefixes []*table.LookupPrefix) (rib *table.Table, err error) {
+func (s *BgpServer) getVrfRib(name string, family bgp.Family, prefixes []*table.LookupPrefix) (rib *table.Table, err error) {
 	err = s.mgmtOperation(func() error {
 		m := s.globalRib
 		vrfs := m.Vrfs
 		if _, ok := vrfs[name]; !ok {
 			return fmt.Errorf("vrf %s not found", name)
 		}
-		var af bgp.RouteFamily
+		var af bgp.Family
 		switch family {
 		case bgp.RF_IPv4_UC:
 			af = bgp.RF_IPv4_VPN
@@ -2757,7 +2830,7 @@ func (s *BgpServer) getVrfRib(name string, family bgp.RouteFamily, prefixes []*t
 	return
 }
 
-func (s *BgpServer) getAdjRib(addr string, family bgp.RouteFamily, in bool, enableFiltered bool, prefixes []*table.LookupPrefix) (rib *table.Table, filtered map[table.PathLocalKey]table.FilteredType, v map[*table.Path]*table.Validation, err error) {
+func (s *BgpServer) getAdjRib(addr string, family bgp.Family, in bool, enableFiltered bool, prefixes []*table.LookupPrefix) (rib *table.Table, filtered map[table.PathLocalKey]table.FilteredType, v map[*table.Path]*table.Validation, err error) {
 	err = s.mgmtOperation(func() error {
 		peer, ok := s.neighborMap[addr]
 		if !ok {
@@ -2773,7 +2846,7 @@ func (s *BgpServer) getAdjRib(addr string, family bgp.RouteFamily, in bool, enab
 			adjRib = peer.adjRibIn
 			if enableFiltered {
 				toUpdate = make([]*table.Path, 0)
-				for _, path := range peer.adjRibIn.PathList([]bgp.RouteFamily{family}, true) {
+				for _, path := range peer.adjRibIn.PathList([]bgp.Family{family}, true) {
 					p := path
 					pathLocalKey := path.GetLocalKey()
 					options := &table.PolicyOptions{
@@ -2845,23 +2918,25 @@ func (s *BgpServer) ListPath(ctx context.Context, r *api.ListPathRequest, fn fun
 	}
 
 	in := false
-	family := bgp.RouteFamily(0)
+	family := bgp.Family(0)
 	if r.Family != nil {
-		family = bgp.AfiSafiToRouteFamily(uint16(r.Family.Afi), uint8(r.Family.Safi))
+		family = bgp.AfiSafiToFamily(uint16(r.Family.Afi), uint8(r.Family.Safi))
 	}
 	var err error
 	switch r.TableType {
-	case api.TableType_LOCAL, api.TableType_GLOBAL:
+	case api.TableType_TABLE_TYPE_UNSPECIFIED:
+		return status.Error(codes.InvalidArgument, "unspecified table type")
+	case api.TableType_TABLE_TYPE_LOCAL, api.TableType_TABLE_TYPE_GLOBAL:
 		tbl, v, err = s.getRib(r.Name, family, f())
-	case api.TableType_ADJ_IN:
+	case api.TableType_TABLE_TYPE_ADJ_IN:
 		in = true
 		fallthrough
-	case api.TableType_ADJ_OUT:
+	case api.TableType_TABLE_TYPE_ADJ_OUT:
 		tbl, filtered, v, err = s.getAdjRib(r.Name, family, in, r.EnableFiltered, f())
-	case api.TableType_VRF:
+	case api.TableType_TABLE_TYPE_VRF:
 		tbl, err = s.getVrfRib(r.Name, family, []*table.LookupPrefix{})
 	default:
-		return fmt.Errorf("unsupported resource type: %v", r.TableType)
+		return status.Errorf(codes.InvalidArgument, "unknown table type %d", r.TableType)
 	}
 
 	if err != nil {
@@ -2880,7 +2955,7 @@ func (s *BgpServer) ListPath(ctx context.Context, r *api.ListPathRequest, fn fun
 				if !table.SelectionOptions.DisableBestPathSelection {
 					if i == 0 {
 						switch r.TableType {
-						case api.TableType_LOCAL, api.TableType_GLOBAL:
+						case api.TableType_TABLE_TYPE_LOCAL, api.TableType_TABLE_TYPE_GLOBAL:
 							p.Best = true
 						}
 					} else if s.bgpConfig.Global.UseMultiplePaths.Config.Enabled && path.Equal(knownPathList[i-1]) {
@@ -2910,7 +2985,7 @@ func (s *BgpServer) ListPath(ctx context.Context, r *api.ListPathRequest, fn fun
 	return err
 }
 
-func (s *BgpServer) getRibInfo(addr string, family bgp.RouteFamily) (info *table.TableInfo, err error) {
+func (s *BgpServer) getRibInfo(addr string, family bgp.Family) (info *table.TableInfo, err error) {
 	err = s.mgmtOperation(func() error {
 		m := s.globalRib
 		id := table.GLOBAL_RIB_NAME
@@ -2928,7 +3003,7 @@ func (s *BgpServer) getRibInfo(addr string, family bgp.RouteFamily) (info *table
 			m = s.rsRib
 		}
 
-		af := bgp.RouteFamily(family)
+		af := bgp.Family(family)
 		tbl, ok := m.Tables[af]
 		if !ok {
 			return fmt.Errorf("address family: %s not supported", af)
@@ -2941,7 +3016,7 @@ func (s *BgpServer) getRibInfo(addr string, family bgp.RouteFamily) (info *table
 	return
 }
 
-func (s *BgpServer) getAdjRibInfo(addr string, family bgp.RouteFamily, in bool) (info *table.TableInfo, err error) {
+func (s *BgpServer) getAdjRibInfo(addr string, family bgp.Family, in bool) (info *table.TableInfo, err error) {
 	err = s.mgmtOperation(func() error {
 		peer, ok := s.neighborMap[addr]
 		if !ok {
@@ -2962,7 +3037,7 @@ func (s *BgpServer) getAdjRibInfo(addr string, family bgp.RouteFamily, in bool) 
 	return
 }
 
-func (s *BgpServer) getVrfRibInfo(name string, family bgp.RouteFamily) (info *table.TableInfo, err error) {
+func (s *BgpServer) getVrfRibInfo(name string, family bgp.Family) (info *table.TableInfo, err error) {
 	err = s.mgmtOperation(func() error {
 		m := s.globalRib
 		vrfs := m.Vrfs
@@ -2970,7 +3045,7 @@ func (s *BgpServer) getVrfRibInfo(name string, family bgp.RouteFamily) (info *ta
 			return fmt.Errorf("vrf %s not found", name)
 		}
 
-		var af bgp.RouteFamily
+		var af bgp.Family
 		switch family {
 		case bgp.RF_IPv4_UC:
 			af = bgp.RF_IPv4_VPN
@@ -3000,25 +3075,27 @@ func (s *BgpServer) GetTable(ctx context.Context, r *api.GetTableRequest) (*api.
 	if r == nil || r.Family == nil {
 		return nil, fmt.Errorf("nil request")
 	}
-	family := bgp.RouteFamily(0)
+	family := bgp.Family(0)
 	if r.Family != nil {
-		family = bgp.AfiSafiToRouteFamily(uint16(r.Family.Afi), uint8(r.Family.Safi))
+		family = bgp.AfiSafiToFamily(uint16(r.Family.Afi), uint8(r.Family.Safi))
 	}
 	var in bool
 	var err error
 	var info *table.TableInfo
 	switch r.TableType {
-	case api.TableType_GLOBAL, api.TableType_LOCAL:
+	case api.TableType_TABLE_TYPE_UNSPECIFIED:
+		return nil, status.Error(codes.InvalidArgument, "unspecified table type")
+	case api.TableType_TABLE_TYPE_GLOBAL, api.TableType_TABLE_TYPE_LOCAL:
 		info, err = s.getRibInfo(r.Name, family)
-	case api.TableType_ADJ_IN:
+	case api.TableType_TABLE_TYPE_ADJ_IN:
 		in = true
 		fallthrough
-	case api.TableType_ADJ_OUT:
+	case api.TableType_TABLE_TYPE_ADJ_OUT:
 		info, err = s.getAdjRibInfo(r.Name, family, in)
-	case api.TableType_VRF:
+	case api.TableType_TABLE_TYPE_VRF:
 		info, err = s.getVrfRibInfo(r.Name, family)
 	default:
-		return nil, fmt.Errorf("unsupported resource type: %s", r.TableType)
+		return nil, status.Errorf(codes.InvalidArgument, "unknown table type %d", r.TableType)
 	}
 
 	if err != nil {
@@ -3138,10 +3215,10 @@ func (s *BgpServer) ListPeer(ctx context.Context, r *api.ListPeerRequest, fn fun
 					if !afisafi.Config.Enabled {
 						continue
 					}
-					afi, safi := bgp.RouteFamilyToAfiSafi(family)
+					afi, safi := bgp.FamilyToAfiSafi(family)
 					c := afisafi.Config
 					if c.Family != nil && c.Family.Afi == api.Family_Afi(afi) && c.Family.Safi == api.Family_Safi(safi) {
-						flist := []bgp.RouteFamily{family}
+						flist := []bgp.Family{family}
 						received := uint64(peer.adjRibIn.Count(flist))
 						accepted := uint64(peer.adjRibIn.Accepted(flist))
 						advertised := uint64(0)
@@ -3689,16 +3766,16 @@ func (s *BgpServer) ResetPeer(ctx context.Context, r *api.ResetPeerRequest) erro
 			if addr == "all" {
 				addr = ""
 			}
-			family := bgp.RouteFamily(0)
+			family := bgp.Family(0)
 			switch r.Direction {
-			case api.ResetPeerRequest_IN:
+			case api.ResetPeerRequest_DIRECTION_IN:
 				err = s.sResetIn(addr, family)
-			case api.ResetPeerRequest_OUT:
+			case api.ResetPeerRequest_DIRECTION_OUT:
 				err = s.sResetOut(addr, family)
-			case api.ResetPeerRequest_BOTH:
+			case api.ResetPeerRequest_DIRECTION_BOTH:
 				err = s.sReset(addr, family)
 			default:
-				err = fmt.Errorf("unknown direction")
+				err = status.Errorf(codes.InvalidArgument, "unknown direction")
 			}
 			return err
 		}
@@ -3773,10 +3850,29 @@ func (s *BgpServer) ListDefinedSet(ctx context.Context, r *api.ListDefinedSetReq
 	if r == nil {
 		return fmt.Errorf("nil request")
 	}
+	var dt table.DefinedType
+	switch r.DefinedType {
+	case api.DefinedType_DEFINED_TYPE_UNSPECIFIED:
+		return status.Error(codes.InvalidArgument, "unspecified defined type")
+	case api.DefinedType_DEFINED_TYPE_PREFIX:
+		dt = table.DEFINED_TYPE_PREFIX
+	case api.DefinedType_DEFINED_TYPE_NEIGHBOR:
+		dt = table.DEFINED_TYPE_NEIGHBOR
+	case api.DefinedType_DEFINED_TYPE_AS_PATH:
+		dt = table.DEFINED_TYPE_AS_PATH
+	case api.DefinedType_DEFINED_TYPE_COMMUNITY:
+		dt = table.DEFINED_TYPE_COMMUNITY
+	case api.DefinedType_DEFINED_TYPE_EXT_COMMUNITY:
+		dt = table.DEFINED_TYPE_EXT_COMMUNITY
+	case api.DefinedType_DEFINED_TYPE_LARGE_COMMUNITY:
+		dt = table.DEFINED_TYPE_LARGE_COMMUNITY
+	default:
+		return status.Errorf(codes.InvalidArgument, "unknown defined type %d", r.DefinedType)
+	}
 	var cd *oc.DefinedSets
 	var err error
 	err = s.mgmtOperation(func() error {
-		cd, err = s.policy.GetDefinedSet(table.DefinedType(r.DefinedType), r.Name)
+		cd, err = s.policy.GetDefinedSet(dt, r.Name)
 		return err
 	}, false)
 
@@ -3795,7 +3891,7 @@ func (s *BgpServer) ListDefinedSet(ctx context.Context, r *api.ListDefinedSetReq
 
 	for _, cs := range cd.PrefixSets {
 		ad := &api.DefinedSet{
-			DefinedType: api.DefinedType_PREFIX,
+			DefinedType: api.DefinedType_DEFINED_TYPE_PREFIX,
 			Name:        cs.PrefixSetName,
 			Prefixes: func() []*api.Prefix {
 				l := make([]*api.Prefix, 0, len(cs.PrefixList))
@@ -3815,7 +3911,7 @@ func (s *BgpServer) ListDefinedSet(ctx context.Context, r *api.ListDefinedSetReq
 	}
 	for _, cs := range cd.NeighborSets {
 		ad := &api.DefinedSet{
-			DefinedType: api.DefinedType_NEIGHBOR,
+			DefinedType: api.DefinedType_DEFINED_TYPE_NEIGHBOR,
 			Name:        cs.NeighborSetName,
 			List:        cs.NeighborInfoList,
 		}
@@ -3825,7 +3921,7 @@ func (s *BgpServer) ListDefinedSet(ctx context.Context, r *api.ListDefinedSetReq
 	}
 	for _, cs := range cd.BgpDefinedSets.CommunitySets {
 		ad := &api.DefinedSet{
-			DefinedType: api.DefinedType_COMMUNITY,
+			DefinedType: api.DefinedType_DEFINED_TYPE_COMMUNITY,
 			Name:        cs.CommunitySetName,
 			List:        cs.CommunityList,
 		}
@@ -3835,7 +3931,7 @@ func (s *BgpServer) ListDefinedSet(ctx context.Context, r *api.ListDefinedSetReq
 	}
 	for _, cs := range cd.BgpDefinedSets.ExtCommunitySets {
 		ad := &api.DefinedSet{
-			DefinedType: api.DefinedType_EXT_COMMUNITY,
+			DefinedType: api.DefinedType_DEFINED_TYPE_EXT_COMMUNITY,
 			Name:        cs.ExtCommunitySetName,
 			List:        cs.ExtCommunityList,
 		}
@@ -3845,7 +3941,7 @@ func (s *BgpServer) ListDefinedSet(ctx context.Context, r *api.ListDefinedSetReq
 	}
 	for _, cs := range cd.BgpDefinedSets.LargeCommunitySets {
 		ad := &api.DefinedSet{
-			DefinedType: api.DefinedType_LARGE_COMMUNITY,
+			DefinedType: api.DefinedType_DEFINED_TYPE_LARGE_COMMUNITY,
 			Name:        cs.LargeCommunitySetName,
 			List:        cs.LargeCommunityList,
 		}
@@ -3855,7 +3951,7 @@ func (s *BgpServer) ListDefinedSet(ctx context.Context, r *api.ListDefinedSetReq
 	}
 	for _, cs := range cd.BgpDefinedSets.AsPathSets {
 		ad := &api.DefinedSet{
-			DefinedType: api.DefinedType_AS_PATH,
+			DefinedType: api.DefinedType_DEFINED_TYPE_AS_PATH,
 			Name:        cs.AsPathSetName,
 			List:        cs.AsPathList,
 		}
@@ -4017,9 +4113,9 @@ func (s *BgpServer) toPolicyInfo(name string, dir api.PolicyDirection) (string, 
 		name = peer.ID()
 	}
 	switch dir {
-	case api.PolicyDirection_IMPORT:
+	case api.PolicyDirection_POLICY_DIRECTION_IMPORT:
 		return name, table.POLICY_DIRECTION_IMPORT, nil
-	case api.PolicyDirection_EXPORT:
+	case api.PolicyDirection_POLICY_DIRECTION_EXPORT:
 		return name, table.POLICY_DIRECTION_EXPORT, nil
 	}
 	return "", table.POLICY_DIRECTION_NONE, fmt.Errorf("invalid policy type")
@@ -4043,8 +4139,8 @@ func (s *BgpServer) ListPolicyAssignment(ctx context.Context, r *api.ListPolicyA
 			names = append(names, r.Name)
 		}
 		dirs := make([]api.PolicyDirection, 0, 2)
-		if r.Direction == api.PolicyDirection_UNKNOWN {
-			dirs = []api.PolicyDirection{api.PolicyDirection_EXPORT, api.PolicyDirection_IMPORT}
+		if r.Direction == api.PolicyDirection_POLICY_DIRECTION_UNSPECIFIED {
+			dirs = []api.PolicyDirection{api.PolicyDirection_POLICY_DIRECTION_EXPORT, api.PolicyDirection_POLICY_DIRECTION_IMPORT}
 		} else {
 			dirs = append(dirs, r.Direction)
 		}
@@ -4125,13 +4221,24 @@ func (s *BgpServer) SetPolicyAssignment(ctx context.Context, r *api.SetPolicyAss
 
 func (s *BgpServer) EnableMrt(ctx context.Context, r *api.EnableMrtRequest) error {
 	if r == nil {
-		return fmt.Errorf("nil request")
+		return status.Errorf(codes.InvalidArgument, "null request")
 	}
+
+	var dump_type oc.MrtType
+	switch r.DumpType {
+	case api.EnableMrtRequest_DUMP_TYPE_UNSPECIFIED:
+		return status.Errorf(codes.InvalidArgument, "unspecified type")
+	case api.EnableMrtRequest_DUMP_TYPE_UPDATES:
+		dump_type = oc.MRT_TYPE_UPDATES
+	case api.EnableMrtRequest_DUMP_TYPE_TABLE:
+		dump_type = oc.MRT_TYPE_TABLE
+	}
+
 	return s.mgmtOperation(func() error {
 		return s.mrtManager.enable(&oc.MrtConfig{
 			DumpInterval:     r.DumpInterval,
 			RotationInterval: r.RotationInterval,
-			DumpType:         oc.IntToMrtTypeMap[int(r.Type)],
+			DumpType:         dump_type,
 			FileName:         r.Filename,
 		})
 	}, false)
@@ -4203,9 +4310,9 @@ func (s *BgpServer) ListRpkiTable(ctx context.Context, r *api.ListRpkiTableReque
 	}
 	var l []*api.Roa
 	err := s.mgmtOperation(func() error {
-		family := bgp.RouteFamily(0)
+		family := bgp.Family(0)
 		if r.Family != nil {
-			family = bgp.AfiSafiToRouteFamily(uint16(r.Family.Afi), uint8(r.Family.Safi))
+			family = bgp.AfiSafiToFamily(uint16(r.Family.Afi), uint8(r.Family.Safi))
 		}
 		roas, err := s.roaTable.List(family)
 		if err == nil {
@@ -4286,14 +4393,16 @@ func (s *BgpServer) WatchEvent(ctx context.Context, r *api.WatchEventRequest, fn
 	if t := r.GetTable(); t != nil {
 		for _, filter := range t.Filters {
 			switch filter.Type {
-			case api.WatchEventRequest_Table_Filter_BEST:
+			case api.WatchEventRequest_Table_Filter_TYPE_BEST:
 				opts = append(opts, watchBestPath(filter.Init))
-			case api.WatchEventRequest_Table_Filter_ADJIN:
+			case api.WatchEventRequest_Table_Filter_TYPE_ADJIN:
 				opts = append(opts, watchUpdate(filter.Init, filter.PeerAddress, filter.PeerGroup))
-			case api.WatchEventRequest_Table_Filter_POST_POLICY:
+			case api.WatchEventRequest_Table_Filter_TYPE_POST_POLICY:
 				opts = append(opts, watchPostUpdate(filter.Init, filter.PeerAddress, filter.PeerGroup))
-			case api.WatchEventRequest_Table_Filter_EOR:
+			case api.WatchEventRequest_Table_Filter_TYPE_EOR:
 				opts = append(opts, watchEor(filter.Init))
+			default:
+				return status.Errorf(codes.InvalidArgument, "unknown filter type %s", filter.Type)
 			}
 		}
 	}
@@ -4353,6 +4462,15 @@ func (s *BgpServer) WatchEvent(ctx context.Context, r *api.WatchEventRequest, fn
 					simpleSend([]*api.Path{path})
 
 				case *watchEventPeer:
+					var admin_state api.PeerState_AdminState
+					switch msg.AdminState {
+					case adminStateUp:
+						admin_state = api.PeerState_ADMIN_STATE_UP
+					case adminStateDown:
+						admin_state = api.PeerState_ADMIN_STATE_DOWN
+					case adminStatePfxCt:
+						admin_state = api.PeerState_ADMIN_STATE_PFX_CT
+					}
 					fn(&api.WatchEventResponse{
 						Event: &api.WatchEventResponse_Peer{
 							Peer: &api.WatchEventResponse_PeerEvent{
@@ -4369,8 +4487,9 @@ func (s *BgpServer) WatchEvent(ctx context.Context, r *api.WatchEventRequest, fn
 										LocalAsn:        msg.LocalAS,
 										NeighborAddress: msg.PeerAddress.String(),
 										SessionState:    api.PeerState_SessionState(int(msg.State) + 1),
-										AdminState:      api.PeerState_AdminState(msg.AdminState),
+										AdminState:      admin_state,
 										RouterId:        msg.PeerID.String(),
+										RemoteCap:       msg.RemoteCap,
 									},
 									Transport: &api.Transport{
 										LocalAddress: msg.LocalAddress.String(),
@@ -4391,8 +4510,27 @@ func (s *BgpServer) WatchEvent(ctx context.Context, r *api.WatchEventRequest, fn
 }
 
 func (s *BgpServer) SetLogLevel(ctx context.Context, r *api.SetLogLevelRequest) error {
-	oldLevel := uint32(s.logger.GetLevel())
-	newLevel := uint32(r.Level)
+	var newLevel log.LogLevel
+	switch r.Level {
+	case api.SetLogLevelRequest_LEVEL_PANIC:
+		newLevel = log.PanicLevel
+	case api.SetLogLevelRequest_LEVEL_FATAL:
+		newLevel = log.FatalLevel
+	case api.SetLogLevelRequest_LEVEL_ERROR:
+		newLevel = log.ErrorLevel
+	case api.SetLogLevelRequest_LEVEL_WARN:
+		newLevel = log.WarnLevel
+	case api.SetLogLevelRequest_LEVEL_INFO:
+		newLevel = log.InfoLevel
+	case api.SetLogLevelRequest_LEVEL_DEBUG:
+		newLevel = log.DebugLevel
+	case api.SetLogLevelRequest_LEVEL_TRACE:
+		newLevel = log.TraceLevel
+	default:
+		return status.Errorf(codes.InvalidArgument, "Unknown log level %s", r.Level)
+	}
+
+	oldLevel := s.logger.GetLevel()
 	if oldLevel == newLevel {
 		s.logger.Info("Logging level unchanged",
 			log.Fields{
@@ -4470,6 +4608,7 @@ type watchEventPeer struct {
 	AdminState    adminState
 	Timestamp     time.Time
 	PeerInterface string
+	RemoteCap     []*api.Capability
 }
 
 type watchEventAdjIn struct {
@@ -4501,7 +4640,7 @@ type watchEventMessage struct {
 }
 
 type watchEventEor struct {
-	Family   bgp.RouteFamily
+	Family   bgp.Family
 	PeerInfo *table.PeerInfo
 }
 
@@ -4835,7 +4974,7 @@ func (s *BgpServer) watch(opts ...watchOption) (w *watcher) {
 						Init:         true,
 						PostPolicy:   false,
 						Neighbor:     configNeighbor,
-						PathList:     peer.adjRibIn.PathList([]bgp.RouteFamily{rf}, false),
+						PathList:     peer.adjRibIn.PathList([]bgp.Family{rf}, false),
 					}
 					peer.fsm.lock.RUnlock()
 					w.notify(update)
@@ -4868,7 +5007,7 @@ func (s *BgpServer) watch(opts ...watchOption) (w *watcher) {
 					continue
 				}
 				pathsByPeer := make(map[*table.PeerInfo][]*table.Path)
-				for _, path := range s.globalRib.GetPathList(table.GLOBAL_RIB_NAME, 0, []bgp.RouteFamily{rf}) {
+				for _, path := range s.globalRib.GetPathList(table.GLOBAL_RIB_NAME, 0, []bgp.Family{rf}) {
 					pathsByPeer[path.GetSource()] = append(pathsByPeer[path.GetSource()], path)
 				}
 				for peerInfo, paths := range pathsByPeer {

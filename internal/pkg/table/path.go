@@ -18,20 +18,23 @@ package table
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net"
 	"sort"
 	"time"
 
-	"github.com/osrg/gobgp/v3/pkg/config/oc"
-	"github.com/osrg/gobgp/v3/pkg/log"
-	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
+	"github.com/osrg/gobgp/v4/pkg/config/oc"
+	"github.com/osrg/gobgp/v4/pkg/log"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
 )
 
 const (
 	DEFAULT_LOCAL_PREF = 100
 )
+
+var ErrNoMedPathAttr error = errors.New("no med path attr")
 
 type Bitmap struct {
 	bitmap []uint64
@@ -152,7 +155,7 @@ const (
 )
 
 type PathDestLocalKey struct {
-	Family bgp.RouteFamily
+	Family bgp.Family
 	Prefix string
 }
 type PathLocalKey struct {
@@ -160,7 +163,7 @@ type PathLocalKey struct {
 	Id uint32
 }
 
-func NewPathDestLocalKey(f bgp.RouteFamily, destPrefix string) *PathDestLocalKey {
+func NewPathDestLocalKey(f bgp.Family, destPrefix string) *PathDestLocalKey {
 	return &PathDestLocalKey{
 		Family: f,
 		Prefix: destPrefix,
@@ -189,9 +192,9 @@ func NewPath(source *PeerInfo, nlri bgp.AddrPrefixInterface, isWithdraw bool, pa
 	}
 }
 
-func NewEOR(family bgp.RouteFamily) *Path {
-	afi, safi := bgp.RouteFamilyToAfiSafi(family)
-	nlri, _ := bgp.NewPrefixFromRouteFamily(afi, safi)
+func NewEOR(family bgp.Family) *Path {
+	afi, safi := bgp.FamilyToAfiSafi(family)
+	nlri, _ := bgp.NewPrefixFromFamily(afi, safi)
 	return &Path{
 		info: &originInfo{
 			nlri: nlri,
@@ -298,7 +301,7 @@ func UpdatePathAttrs(logger log.Logger, global *oc.Global, peer *oc.Neighbor, in
 			// the Originator attribute shall be set to the router-id of the
 			// advertiser, and the Next-hop attribute shall be set of the local
 			// address for that session.
-			if path.GetRouteFamily() == bgp.RF_RTC_UC {
+			if path.GetFamily() == bgp.RF_RTC_UC {
 				path.SetNexthop(localAddress)
 				path.setPathAttr(bgp.NewPathAttributeOriginatorId(info.LocalID.String()))
 			} else if path.getPathAttr(bgp.BGP_ATTR_TYPE_ORIGINATOR_ID) == nil {
@@ -384,8 +387,8 @@ func (path *Path) SetIsFromExternal(y bool) {
 	path.OriginInfo().isFromExternal = y
 }
 
-func (path *Path) GetRouteFamily() bgp.RouteFamily {
-	return bgp.AfiSafiToRouteFamily(path.OriginInfo().nlri.AFI(), path.OriginInfo().nlri.SAFI())
+func (path *Path) GetFamily() bgp.Family {
+	return bgp.AfiSafiToFamily(path.OriginInfo().nlri.AFI(), path.OriginInfo().nlri.SAFI())
 }
 
 func (path *Path) GetSource() *PeerInfo {
@@ -463,7 +466,7 @@ func (path *Path) GetNexthop() net.IP {
 }
 
 func (path *Path) SetNexthop(nexthop net.IP) {
-	if path.GetRouteFamily() == bgp.RF_IPv4_UC && nexthop.To4() == nil {
+	if path.GetFamily() == bgp.RF_IPv4_UC && nexthop.To4() == nil {
 		path.delPathAttr(bgp.BGP_ATTR_TYPE_NEXT_HOP)
 		mpreach := bgp.NewPathAttributeMpReachNLRI(nexthop.String(), []bgp.AddrPrefixInterface{path.GetNlri()})
 		path.setPathAttr(mpreach)
@@ -587,7 +590,7 @@ func (path *Path) delPathAttr(typ bgp.BGPAttrType) {
 func (path *Path) String() string {
 	s := bytes.NewBuffer(make([]byte, 0, 64))
 	if path.IsEOR() {
-		s.WriteString(fmt.Sprintf("{ %s EOR | src: %s }", path.GetRouteFamily(), path.GetSource()))
+		s.WriteString(fmt.Sprintf("{ %s EOR | src: %s }", path.GetFamily(), path.GetSource()))
 		return s.String()
 	}
 	s.WriteString(fmt.Sprintf("{ %s | ", path.GetPrefix()))
@@ -614,7 +617,7 @@ func (path *Path) GetLocalKey() PathLocalKey {
 // GetDestLocalKey identifies the path destination in the local BGP server.
 func (path *Path) GetDestLocalKey() PathDestLocalKey {
 	return PathDestLocalKey{
-		Family: path.GetRouteFamily(),
+		Family: path.GetFamily(),
 		Prefix: path.GetNlri().String(),
 	}
 }
@@ -963,7 +966,7 @@ func (path *Path) SetLargeCommunities(cs []*bgp.LargeCommunity, doReplace bool) 
 func (path *Path) GetMed() (uint32, error) {
 	attr := path.getPathAttr(bgp.BGP_ATTR_TYPE_MULTI_EXIT_DISC)
 	if attr == nil {
-		return 0, fmt.Errorf("no med path attr")
+		return 0, ErrNoMedPathAttr
 	}
 	return attr.(*bgp.PathAttributeMultiExitDisc).Value, nil
 }
@@ -1033,6 +1036,21 @@ func (path *Path) GetLocalPref() (uint32, error) {
 	return lp, nil
 }
 
+func (lhs *Path) EqualBySourceAndPathID(rhs *Path) bool {
+	if rhs == nil {
+		return false
+	}
+	if lhs == rhs {
+		return true
+	}
+
+	if !lhs.GetSource().Equal(rhs.GetSource()) {
+		return false
+	}
+
+	return lhs.GetNlri().PathIdentifier() == rhs.GetNlri().PathIdentifier()
+}
+
 func (lhs *Path) Equal(rhs *Path) bool {
 	if rhs == nil {
 		return false
@@ -1077,6 +1095,9 @@ func (path *Path) MarshalJSON() ([]byte, error) {
 	})
 }
 
+// Return > 0 if lhs is preferred over the rhs
+// Return 0 if they are equal
+// Return < 0 if rhs is preferred over the lhs
 func (lhs *Path) Compare(rhs *Path) int {
 	if lhs.IsLocal() && !rhs.IsLocal() {
 		return 1
@@ -1093,29 +1114,29 @@ func (lhs *Path) Compare(rhs *Path) int {
 	lp1, _ := lhs.GetLocalPref()
 	lp2, _ := rhs.GetLocalPref()
 	if lp1 != lp2 {
-		return int(lp1 - lp2)
+		return int(lp1) - int(lp2)
 	}
 
 	l1 := lhs.GetAsPathLen()
 	l2 := rhs.GetAsPathLen()
 	if l1 != l2 {
-		return int(l2 - l1)
+		return int(l2) - int(l1)
 	}
 
 	o1, _ := lhs.GetOrigin()
 	o2, _ := rhs.GetOrigin()
 	if o1 != o2 {
-		return int(o2 - o1)
+		return int(o2) - int(o1)
 	}
 
 	m1, _ := lhs.GetMed()
 	m2, _ := rhs.GetMed()
-	return int(m2 - m1)
+	return int(m2) - int(m1)
 }
 
 func (v *Vrf) ToGlobalPath(path *Path) error {
 	nlri := path.GetNlri()
-	switch rf := path.GetRouteFamily(); rf {
+	switch rf := path.GetFamily(); rf {
 	case bgp.RF_IPv4_UC:
 		n := nlri.(*bgp.IPAddrPrefix)
 		pathIdentifier := path.GetNlri().PathIdentifier()
@@ -1167,7 +1188,7 @@ func (p *Path) ToGlobal(vrf *Vrf) *Path {
 	nlri := p.GetNlri()
 	nh := p.GetNexthop()
 	pathId := nlri.PathIdentifier()
-	switch rf := p.GetRouteFamily(); rf {
+	switch rf := p.GetFamily(); rf {
 	case bgp.RF_IPv4_UC:
 		n := nlri.(*bgp.IPAddrPrefix)
 		nlri = bgp.NewLabeledVPNIPAddrPrefix(n.Length, n.Prefix.String(), *bgp.NewMPLSLabelStack(vrf.MplsLabel), vrf.Rd)
@@ -1230,7 +1251,7 @@ func (p *Path) ToGlobal(vrf *Vrf) *Path {
 
 func (p *Path) ToLocal() *Path {
 	nlri := p.GetNlri()
-	f := p.GetRouteFamily()
+	f := p.GetFamily()
 	localPathId := nlri.PathLocalIdentifier()
 	pathId := nlri.PathIdentifier()
 	switch f {

@@ -33,7 +33,7 @@ jobs:
           go-version: 'stable'
       - run: |
           go test -race -timeout 240s ./...
-          if [ "$(go env GOARCH)" = "amd64" ]; then go test -race github.com/osrg/gobgp/v3/pkg/packet/bgp -run ^Test_RaceCondition$; else echo 'skip'; fi
+          if [ "$(go env GOARCH)" = "amd64" ]; then go test -race github.com/osrg/gobgp/v4/pkg/packet/bgp -run ^Test_RaceCondition$; else echo 'skip'; fi
 
   unit386:
     name: unit386
@@ -49,6 +49,21 @@ jobs:
           go env GOARCH
           go test -timeout 240s ./...
 
+  protobuf-check:
+    name: protobuf lint and format check
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v3
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          version: latest
+
+      - name: buf lint
+        run: buf lint proto/
+
+      - name: buf format check
+        run: buf format --diff --exit-code
+
   golangci:
     name: lint
     runs-on: ubuntu-22.04
@@ -60,8 +75,8 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v3
 
-  embeded:
-    name: embeded
+  embedded:
+    name: embedded
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v3
@@ -69,8 +84,8 @@ jobs:
         with:
           go-version: 'stable'
       - run: |
-          python test/scenario_test/ci-scripts/build_embeded_go.py docs/sources/lib.md
-          python test/scenario_test/ci-scripts/build_embeded_go.py docs/sources/lib-ls.md
+          python test/scenario_test/ci-scripts/build_embedded_go.py docs/sources/lib.md
+          python test/scenario_test/ci-scripts/build_embedded_go.py docs/sources/bgp-ls.md
 
   lintdoc:
     name: lintdoc

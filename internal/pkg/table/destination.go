@@ -21,11 +21,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"slices"
 	"sort"
 
-	"github.com/osrg/gobgp/v3/pkg/config/oc"
-	"github.com/osrg/gobgp/v3/pkg/log"
-	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
+	"github.com/osrg/gobgp/v4/pkg/config/oc"
+	"github.com/osrg/gobgp/v4/pkg/log"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
 )
 
 var SelectionOptions oc.RouteSelectionOptionsConfig
@@ -135,7 +136,7 @@ func NewPeerInfo(g *oc.Global, p *oc.Neighbor) *PeerInfo {
 }
 
 type Destination struct {
-	routeFamily   bgp.RouteFamily
+	family        bgp.Family
 	nlri          bgp.AddrPrefixInterface
 	knownPathList []*Path
 	localIdMap    *Bitmap
@@ -143,7 +144,7 @@ type Destination struct {
 
 func NewDestination(nlri bgp.AddrPrefixInterface, mapSize int, known ...*Path) *Destination {
 	d := &Destination{
-		routeFamily:   bgp.AfiSafiToRouteFamily(nlri.AFI(), nlri.SAFI()),
+		family:        bgp.AfiSafiToFamily(nlri.AFI(), nlri.SAFI()),
 		nlri:          nlri,
 		knownPathList: known,
 		localIdMap:    NewBitmap(mapSize),
@@ -155,12 +156,12 @@ func NewDestination(nlri bgp.AddrPrefixInterface, mapSize int, known ...*Path) *
 	return d
 }
 
-func (dd *Destination) Family() bgp.RouteFamily {
-	return dd.routeFamily
+func (dd *Destination) Family() bgp.Family {
+	return dd.family
 }
 
-func (dd *Destination) setRouteFamily(routeFamily bgp.RouteFamily) {
-	dd.routeFamily = routeFamily
+func (dd *Destination) setFamily(Family bgp.Family) {
+	dd.family = Family
 }
 
 func (dd *Destination) GetNlri() bgp.AddrPrefixInterface {
@@ -238,7 +239,7 @@ func (dest *Destination) Calculate(logger log.Logger, newPath *Path) *Update {
 		}
 	} else {
 		dest.implicitWithdraw(logger, newPath)
-		dest.knownPathList = append(dest.knownPathList, newPath)
+		dest.insertSort(newPath)
 	}
 
 	for _, path := range dest.knownPathList {
@@ -251,8 +252,6 @@ func (dest *Destination) Calculate(logger log.Logger, newPath *Path) *Update {
 			path.GetNlri().SetPathLocalIdentifier(uint32(id))
 		}
 	}
-	// Compute new best path
-	dest.computeKnownBestPath()
 
 	l := make([]*Path, len(dest.knownPathList))
 	copy(l, dest.knownPathList)
@@ -291,7 +290,7 @@ func (dest *Destination) explicitWithdraw(logger log.Logger, withdraw *Path) *Pa
 	isFound := -1
 	for i, path := range dest.knownPathList {
 		// We have a match if the source and path-id are same.
-		if path.GetSource().Equal(withdraw.GetSource()) && path.GetNlri().PathIdentifier() == withdraw.GetNlri().PathIdentifier() {
+		if path.EqualBySourceAndPathID(withdraw) {
 			isFound = i
 			withdraw.GetNlri().SetPathLocalIdentifier(path.GetNlri().PathLocalIdentifier())
 		}
@@ -319,14 +318,14 @@ func (dest *Destination) explicitWithdraw(logger log.Logger, withdraw *Path) *Pa
 func (dest *Destination) implicitWithdraw(logger log.Logger, newPath *Path) {
 	found := -1
 	for i, path := range dest.knownPathList {
-		if newPath.NoImplicitWithdraw() {
+		if path.NoImplicitWithdraw() {
 			continue
 		}
 		// Here we just check if source is same and not check if path
 		// version num. as newPaths are implicit withdrawal of old
 		// paths and when doing RouteRefresh (not EnhancedRouteRefresh)
 		// we get same paths again.
-		if newPath.GetSource().Equal(path.GetSource()) && newPath.GetNlri().PathIdentifier() == path.GetNlri().PathIdentifier() {
+		if newPath.EqualBySourceAndPathID(path) {
 			if logger.GetLevel() >= log.DebugLevel {
 				logger.Debug("Implicit withdrawal of old path, since we have learned new path from the same peer",
 					log.Fields{
@@ -345,47 +344,11 @@ func (dest *Destination) implicitWithdraw(logger log.Logger, newPath *Path) {
 	}
 }
 
-func (dest *Destination) computeKnownBestPath() (*Path, BestPathReason, error) {
-	if SelectionOptions.DisableBestPathSelection {
-		return nil, BPR_DISABLED, nil
-	}
-
-	// If we do not have any paths to this destination, then we do not have
-	// new best path.
-	if len(dest.knownPathList) == 0 {
-		return nil, BPR_UNKNOWN, nil
-	}
-
-	// We pick the first path as current best path. This helps in breaking
-	// tie between two new paths learned in one cycle for which best-path
-	// calculation steps lead to tie.
-	if len(dest.knownPathList) == 1 {
-		// If the first path has the invalidated next-hop, which evaluated by
-		// IGP, returns no path with the reason of the next-hop reachability.
-		if dest.knownPathList[0].IsNexthopInvalid {
-			return nil, BPR_REACHABLE_NEXT_HOP, nil
-		}
-		return dest.knownPathList[0], BPR_ONLY_PATH, nil
-	}
-	reason := dest.sort()
-	newBest := dest.knownPathList[0]
-	// If the first path has the invalidated next-hop, which evaluated by IGP,
-	// returns no path with the reason of the next-hop reachability.
-	if dest.knownPathList[0].IsNexthopInvalid {
-		return nil, BPR_REACHABLE_NEXT_HOP, nil
-	}
-	return newBest, reason, nil
-}
-
-func (dst *Destination) sort() BestPathReason {
-	reason := BPR_UNKNOWN
-
-	sort.SliceStable(dst.knownPathList, func(i, j int) bool {
-		//Compares given paths and returns best path.
-		//
-		//Parameters:
-		//	-`path1`: first path to compare
-		//	-`path2`: second path to compare
+func (dest *Destination) insertSort(newPath *Path) {
+	// Find the correct position for newPath
+	insertIdx := sort.Search(len(dest.knownPathList), func(i int) bool {
+		//Determine where in the array newPath belongs. The slice
+		//is assumed to be in descending order: most preferred to least.
 		//
 		//	Best path processing will involve following steps:
 		//	1.  Select a path with a reachable next hop.
@@ -410,72 +373,79 @@ func (dst *Destination) sort() BestPathReason {
 		//	path.
 		//	Assumes paths from NC has source equal to None.
 		//
+		path1 := newPath
+		path2 := dest.knownPathList[i]
 
-		path1 := dst.knownPathList[i]
-		path2 := dst.knownPathList[j]
-
-		var better *Path
-
-		// draft-uttaro-idr-bgp-persistence-02
-		if better == nil {
-			better = compareByLLGRStaleCommunity(path1, path2)
-			reason = BPR_NON_LLGR_STALE
-		}
-		// Follow best path calculation algorithm steps.
-		// compare by reachability
-		if better == nil {
-			better = compareByReachableNexthop(path1, path2)
-			reason = BPR_REACHABLE_NEXT_HOP
+		if b := compareByLLGRStaleCommunity(path1, path2); b == path1 {
+			return true
+		} else if b == path2 {
+			return false
 		}
 
-		// compareByHighestWeight was a no-op and was removed.
-
-		if better == nil {
-			better = compareByLocalPref(path1, path2)
-			reason = BPR_LOCAL_PREF
-		}
-		if better == nil {
-			better = compareByLocalOrigin(path1, path2)
-			reason = BPR_LOCAL_ORIGIN
-		}
-		if better == nil {
-			better = compareByASPath(path1, path2)
-			reason = BPR_ASPATH
-		}
-		if better == nil {
-			better = compareByOrigin(path1, path2)
-			reason = BPR_ORIGIN
-		}
-		if better == nil {
-			better = compareByMED(path1, path2)
-			reason = BPR_MED
-		}
-		if better == nil {
-			better = compareByASNumber(path1, path2)
-			reason = BPR_ASN
+		if b := compareByReachableNexthop(path1, path2); b == path1 {
+			return true
+		} else if b == path2 {
+			return false
 		}
 
-		// compareByIGPCost was a no-op and was removed.
+		if b := compareByLocalPref(path1, path2); b == path1 {
+			return true
+		} else if b == path2 {
+			return false
+		}
 
-		if better == nil {
-			better = compareByAge(path1, path2)
-			reason = BPR_OLDER
+		if b := compareByLocalOrigin(path1, path2); b == path1 {
+			return true
+		} else if b == path2 {
+			return false
 		}
-		if better == nil {
-			better, _ = compareByRouterID(path1, path2)
-			reason = BPR_ROUTER_ID
+
+		if b := compareByASPath(path1, path2); b == path1 {
+			return true
+		} else if b == path2 {
+			return false
 		}
-		if better == nil {
-			better = compareByNeighborAddress(path1, path2)
-			reason = BPR_NEIGH_ADDR
+
+		if b := compareByOrigin(path1, path2); b == path1 {
+			return true
+		} else if b == path2 {
+			return false
 		}
-		if better == nil {
-			reason = BPR_UNKNOWN
-			better = path1
+
+		if b := compareByMED(path1, path2); b == path1 {
+			return true
+		} else if b == path2 {
+			return false
 		}
-		return better == path1
+
+		if b := compareByASNumber(path1, path2); b == path1 {
+			return true
+		} else if b == path2 {
+			return false
+		}
+
+		if b := compareByAge(path1, path2); b == path1 {
+			return true
+		} else if b == path2 {
+			return false
+		}
+
+		if b, _ := compareByRouterID(path1, path2); b == path1 {
+			return true
+		} else if b == path2 {
+			return false
+		}
+
+		if b := compareByNeighborAddress(path1, path2); b == path1 {
+			return true
+		} else if b == path2 {
+			return false
+		}
+		return true
 	})
-	return reason
+
+	// Insert at the found position
+	dest.knownPathList = slices.Insert(dest.knownPathList, insertIdx, newPath)
 }
 
 type Update struct {
@@ -484,19 +454,23 @@ type Update struct {
 }
 
 func getMultiBestPath(id string, pathList []*Path) []*Path {
-	list := make([]*Path, 0, len(pathList))
-	var best *Path
-	for _, p := range pathList {
-		if !p.IsNexthopInvalid {
-			if best == nil {
-				best = p
-				list = append(list, p)
-			} else if best.Compare(p) == 0 {
-				list = append(list, p)
-			}
-		}
+	// The path list of destinations in the global RIB are sorted
+	// in descending order. One of the criteria for being a better
+	// path is that it has a reachable next hop. Technically, if the
+	// first path is unreachable, then it's assumed none of them
+	// are. Therefore, we return an empty slice.
+	if len(pathList) == 0 || (len(pathList) > 0 && pathList[0].IsNexthopInvalid) {
+		// No reachable next hop found, so we return an empty slice.
+		return []*Path{}
 	}
-	return list
+	var best *Path = pathList[0]
+
+	// Attempt to find the first path that is both reachable and worse than the
+	// best path. Then return a slice paths from the best to that index.
+	index := sort.Search(len(pathList), func(i int) bool {
+		return pathList[i].IsNexthopInvalid || pathList[i].Compare(best) != 0
+	})
+	return pathList[0:index]
 }
 
 func (u *Update) GetWithdrawnPath() []*Path {
@@ -532,7 +506,7 @@ func (u *Update) GetChanges(id string, as uint32, peerDown bool) (*Path, *Path, 
 			// peers, it is necessary to consider all available iBGP paths for a
 			// given RT prefix, for building the outbound route filter, and not just
 			// the best path.
-			if best.GetRouteFamily() == bgp.RF_RTC_UC {
+			if best.GetFamily() == bgp.RF_RTC_UC {
 				return best, old
 			}
 			// For BGP Nexthop Tracking, checks if the nexthop reachability

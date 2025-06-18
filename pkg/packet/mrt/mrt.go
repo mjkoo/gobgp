@@ -24,7 +24,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
 )
 
 const (
@@ -55,6 +55,15 @@ const (
 	OSPFv3       MRTType = 48
 	OSPFv3_ET    MRTType = 49
 )
+
+func (t MRTType) HasExtendedTimestamp() bool {
+	switch t {
+	case BGP4MP_ET, ISIS_ET, OSPFv3_ET:
+		return true
+	default:
+		return false
+	}
+}
 
 type MRTSubTyper interface {
 	ToUint16() uint16
@@ -111,7 +120,7 @@ const (
 	ESTABLISHED BGPState = 6
 )
 
-func packValues(values []interface{}) ([]byte, error) {
+func packValues(values ...any) ([]byte, error) {
 	b := new(bytes.Buffer)
 	for _, v := range values {
 		err := binary.Write(b, binary.BigEndian, v)
@@ -123,10 +132,11 @@ func packValues(values []interface{}) ([]byte, error) {
 }
 
 type MRTHeader struct {
-	Timestamp uint32
-	Type      MRTType
-	SubType   uint16
-	Len       uint32
+	Timestamp                     uint32
+	Type                          MRTType
+	SubType                       uint16
+	Len                           uint32
+	ExtendedTimestampMicroseconds uint32
 }
 
 func (h *MRTHeader) DecodeFromBytes(data []byte) error {
@@ -137,25 +147,41 @@ func (h *MRTHeader) DecodeFromBytes(data []byte) error {
 	h.Type = MRTType(binary.BigEndian.Uint16(data[4:6]))
 	h.SubType = binary.BigEndian.Uint16(data[6:8])
 	h.Len = binary.BigEndian.Uint32(data[8:12])
+	if h.Type.HasExtendedTimestamp() {
+		if len(data) < 16 {
+			return fmt.Errorf("not all MRTHeader bytes are available. expected: %d, actual: %d", 16, len(data))
+		}
+		h.ExtendedTimestampMicroseconds = binary.BigEndian.Uint32(data[12:16])
+	}
 	return nil
 }
 
 func (h *MRTHeader) Serialize() ([]byte, error) {
-	return packValues([]interface{}{h.Timestamp, h.Type, h.SubType, h.Len})
+	fields := []any{h.Timestamp, h.Type, h.SubType, h.Len}
+	if h.Type.HasExtendedTimestamp() {
+		fields = append(fields, h.ExtendedTimestampMicroseconds)
+	}
+	return packValues(fields...)
 }
 
-func NewMRTHeader(timestamp uint32, t MRTType, subtype MRTSubTyper, l uint32) (*MRTHeader, error) {
+func NewMRTHeader(timestamp time.Time, t MRTType, subtype MRTSubTyper, l uint32) (*MRTHeader, error) {
+	ms := uint32(0)
+	if t.HasExtendedTimestamp() {
+		ms = uint32(timestamp.UnixMicro() - timestamp.Unix()*1000000)
+	}
 	return &MRTHeader{
-		Timestamp: timestamp,
-		Type:      t,
-		SubType:   subtype.ToUint16(),
-		Len:       l,
+		Timestamp:                     uint32(timestamp.Unix()),
+		Type:                          t,
+		SubType:                       subtype.ToUint16(),
+		Len:                           l,
+		ExtendedTimestampMicroseconds: ms,
 	}, nil
 }
 
 func (h *MRTHeader) GetTime() time.Time {
 	t := int64(h.Timestamp)
-	return time.Unix(t, 0)
+	ms := int64(h.ExtendedTimestampMicroseconds)
+	return time.Unix(t, ms*1000)
 }
 
 type MRTMessage struct {
@@ -176,7 +202,7 @@ func (m *MRTMessage) Serialize() ([]byte, error) {
 	return append(bbuf, buf...), nil
 }
 
-func NewMRTMessage(timestamp uint32, t MRTType, subtype MRTSubTyper, body Body) (*MRTMessage, error) {
+func NewMRTMessage(timestamp time.Time, t MRTType, subtype MRTSubTyper, body Body) (*MRTMessage, error) {
 	header, err := NewMRTHeader(timestamp, t, subtype, 0)
 	if err != nil {
 		return nil, err
@@ -252,12 +278,12 @@ func (p *Peer) Serialize() ([]byte, error) {
 		buf = append(buf, p.IpAddress.To4()...)
 	}
 	if p.Type&(1<<1) > 0 {
-		bbuf, err = packValues([]interface{}{p.AS})
+		bbuf, err = packValues(p.AS)
 	} else {
 		if p.AS > uint32(math.MaxUint16) {
 			return nil, fmt.Errorf("AS number is beyond 2 octet. %d > %d", p.AS, math.MaxUint16)
 		}
-		bbuf, err = packValues([]interface{}{uint16(p.AS)})
+		bbuf, err = packValues(uint16(p.AS))
 	}
 	if err != nil {
 		return nil, err
@@ -372,6 +398,9 @@ func (e *RibEntry) DecodeFromBytes(data []byte, prefix ...bgp.AddrPrefixInterfac
 	e.PeerIndex = binary.BigEndian.Uint16(data[:2])
 	e.OriginatedTime = binary.BigEndian.Uint32(data[2:6])
 	if e.isAddPath {
+		if len(data) < 10+2 {
+			return nil, errNotAllRibEntryBytesAvailable
+		}
 		e.PathIdentifier = binary.BigEndian.Uint32(data[6:10])
 		data = data[10:]
 	} else {
@@ -461,30 +490,32 @@ func (e *RibEntry) String() string {
 	} else {
 		return fmt.Sprintf("RIB_ENTRY: PeerIndex [%d] OriginatedTime [%d] PathAttributes [%v]", e.PeerIndex, e.OriginatedTime, e.PathAttributes)
 	}
-
 }
 
 type Rib struct {
 	SequenceNumber uint32
 	Prefix         bgp.AddrPrefixInterface
 	Entries        []*RibEntry
-	RouteFamily    bgp.RouteFamily
+	Family         bgp.Family
 	isAddPath      bool
 }
 
 func (u *Rib) DecodeFromBytes(data []byte) error {
 	if len(data) < 4 {
-		return fmt.Errorf("not all RibIpv4Unicast message bytes available")
+		return errors.New("not all RibIpv4Unicast message bytes available")
 	}
 	u.SequenceNumber = binary.BigEndian.Uint32(data[:4])
 	data = data[4:]
-	afi, safi := bgp.RouteFamilyToAfiSafi(u.RouteFamily)
+	afi, safi := bgp.FamilyToAfiSafi(u.Family)
 	if afi == 0 && safi == 0 {
+		if len(data) < 3 {
+			return errors.New("not all RibIpv4Unicast message bytes available")
+		}
 		afi = binary.BigEndian.Uint16(data[:2])
 		safi = data[2]
 		data = data[3:]
 	}
-	prefix, err := bgp.NewPrefixFromRouteFamily(afi, safi)
+	prefix, err := bgp.NewPrefixFromFamily(afi, safi)
 	if err != nil {
 		return err
 	}
@@ -493,6 +524,9 @@ func (u *Rib) DecodeFromBytes(data []byte) error {
 		return err
 	}
 	u.Prefix = prefix
+	if len(data) < prefix.Len()+2 {
+		return errors.New("not all RibIpv4Unicast message bytes available")
+	}
 	data = data[prefix.Len():]
 	entryNum := binary.BigEndian.Uint16(data[:2])
 	data = data[2:]
@@ -513,7 +547,7 @@ func (u *Rib) DecodeFromBytes(data []byte) error {
 func (u *Rib) Serialize() ([]byte, error) {
 	buf := make([]byte, 4)
 	binary.BigEndian.PutUint32(buf, u.SequenceNumber)
-	rf := bgp.AfiSafiToRouteFamily(u.Prefix.AFI(), u.Prefix.SAFI())
+	rf := bgp.AfiSafiToFamily(u.Prefix.AFI(), u.Prefix.SAFI())
 	switch rf {
 	case bgp.RF_IPv4_UC, bgp.RF_IPv4_MC, bgp.RF_IPv6_UC, bgp.RF_IPv6_MC:
 	default:
@@ -527,7 +561,7 @@ func (u *Rib) Serialize() ([]byte, error) {
 		return nil, err
 	}
 	buf = append(buf, bbuf...)
-	bbuf, err = packValues([]interface{}{uint16(len(u.Entries))})
+	bbuf, err = packValues(uint16(len(u.Entries)))
 	if err != nil {
 		return nil, err
 	}
@@ -543,12 +577,12 @@ func (u *Rib) Serialize() ([]byte, error) {
 }
 
 func NewRib(seq uint32, prefix bgp.AddrPrefixInterface, entries []*RibEntry) *Rib {
-	rf := bgp.AfiSafiToRouteFamily(prefix.AFI(), prefix.SAFI())
+	rf := bgp.AfiSafiToFamily(prefix.AFI(), prefix.SAFI())
 	return &Rib{
 		SequenceNumber: seq,
 		Prefix:         prefix,
 		Entries:        entries,
-		RouteFamily:    rf,
+		Family:         rf,
 		isAddPath:      entries[0].isAddPath,
 	}
 }
@@ -677,9 +711,9 @@ type BGP4MPHeader struct {
 }
 
 func (m *BGP4MPHeader) decodeFromBytes(data []byte) ([]byte, error) {
-	if m.isAS4 && len(data) < 8 {
+	if m.isAS4 && len(data) < 12 {
 		return nil, errors.New("not all BGP4MPMessageAS4 bytes available")
-	} else if !m.isAS4 && len(data) < 4 {
+	} else if !m.isAS4 && len(data) < 8 {
 		return nil, errors.New("not all BGP4MPMessageAS bytes available")
 	}
 
@@ -696,10 +730,16 @@ func (m *BGP4MPHeader) decodeFromBytes(data []byte) ([]byte, error) {
 	m.AddressFamily = binary.BigEndian.Uint16(data[2:4])
 	switch m.AddressFamily {
 	case bgp.AFI_IP:
+		if len(data) < 12 {
+			return nil, errors.New("not all IPv4 peer bytes available")
+		}
 		m.PeerIpAddress = net.IP(data[4:8]).To4()
 		m.LocalIpAddress = net.IP(data[8:12]).To4()
 		data = data[12:]
 	case bgp.AFI_IP6:
+		if len(data) < 36 {
+			return nil, errors.New("not all IPv6 peer bytes available")
+		}
 		m.PeerIpAddress = net.IP(data[4:20])
 		m.LocalIpAddress = net.IP(data[20:36])
 		data = data[36:]
@@ -710,13 +750,13 @@ func (m *BGP4MPHeader) decodeFromBytes(data []byte) ([]byte, error) {
 }
 
 func (m *BGP4MPHeader) serialize() ([]byte, error) {
-	var values []interface{}
+	var values []any
 	if m.isAS4 {
-		values = []interface{}{m.PeerAS, m.LocalAS, m.InterfaceIndex, m.AddressFamily}
+		values = []any{m.PeerAS, m.LocalAS, m.InterfaceIndex, m.AddressFamily}
 	} else {
-		values = []interface{}{uint16(m.PeerAS), uint16(m.LocalAS), m.InterfaceIndex, m.AddressFamily}
+		values = []any{uint16(m.PeerAS), uint16(m.LocalAS), m.InterfaceIndex, m.AddressFamily}
 	}
-	buf, err := packValues(values)
+	buf, err := packValues(values...)
 	if err != nil {
 		return nil, err
 	}
@@ -786,7 +826,7 @@ func (m *BGP4MPStateChange) Serialize() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	bbuf, err := packValues([]interface{}{m.OldState, m.NewState})
+	bbuf, err := packValues(m.OldState, m.NewState)
 	if err != nil {
 		return nil, err
 	}
@@ -901,14 +941,14 @@ func SplitMrt(data []byte, atEOF bool) (advance int, token []byte, err error) {
 	if cap(data) < MRT_COMMON_HEADER_LEN { // read more
 		return 0, nil, nil
 	}
-	//this reads the data
+	// this reads the data
 	hdr := &MRTHeader{}
 	errh := hdr.DecodeFromBytes(data[:MRT_COMMON_HEADER_LEN])
 	if errh != nil {
 		return 0, nil, errh
 	}
 	totlen := int(hdr.Len + MRT_COMMON_HEADER_LEN)
-	if len(data) < totlen { //need to read more
+	if len(data) < totlen { // need to read more
 		return 0, nil, nil
 	}
 	return totlen, data[0:totlen], nil
@@ -922,7 +962,7 @@ func ParseMRTBody(h *MRTHeader, data []byte) (*MRTMessage, error) {
 	switch h.Type {
 	case TABLE_DUMPv2:
 		subType := MRTSubTypeTableDumpv2(h.SubType)
-		rf := bgp.RouteFamily(0)
+		rf := bgp.Family(0)
 		isAddPath := false
 		switch subType {
 		case PEER_INDEX_TABLE:
@@ -958,8 +998,8 @@ func ParseMRTBody(h *MRTHeader, data []byte) (*MRTMessage, error) {
 
 		if msg.Body == nil {
 			msg.Body = &Rib{
-				RouteFamily: rf,
-				isAddPath:   isAddPath,
+				Family:    rf,
+				isAddPath: isAddPath,
 			}
 		}
 	case BGP4MP:

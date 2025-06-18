@@ -27,10 +27,10 @@ import (
 	"sync"
 
 	"github.com/k-sone/critbitgo"
-	api "github.com/osrg/gobgp/v3/api"
-	"github.com/osrg/gobgp/v3/pkg/config/oc"
-	"github.com/osrg/gobgp/v3/pkg/log"
-	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
+	"github.com/osrg/gobgp/v4/api"
+	"github.com/osrg/gobgp/v4/pkg/config/oc"
+	"github.com/osrg/gobgp/v4/pkg/log"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
 )
 
 type PolicyOptions struct {
@@ -98,6 +98,18 @@ const (
 	MATCH_OPTION_INVERT
 )
 
+func (o MatchOption) ToApi() api.MatchSet_Type {
+	switch o {
+	case MATCH_OPTION_ANY:
+		return api.MatchSet_TYPE_ANY
+	case MATCH_OPTION_ALL:
+		return api.MatchSet_TYPE_ALL
+	case MATCH_OPTION_INVERT:
+		return api.MatchSet_TYPE_INVERT
+	}
+	panic(fmt.Sprintf("unknown MatchOption: %d", o))
+}
+
 func (o MatchOption) String() string {
 	switch o {
 	case MATCH_OPTION_ANY:
@@ -124,7 +136,8 @@ func (o MatchOption) ConvertToMatchSetOptionsRestrictedType() oc.MatchSetOptions
 type MedActionType int
 
 const (
-	MED_ACTION_MOD MedActionType = iota
+	MED_ACTION_UNSPECIFIED MedActionType = iota
+	MED_ACTION_MOD
 	MED_ACTION_REPLACE
 )
 
@@ -254,13 +267,13 @@ func (l DefinedSetList) Less(i, j int) bool {
 
 type Prefix struct {
 	Prefix             *net.IPNet
-	AddressFamily      bgp.RouteFamily
+	AddressFamily      bgp.Family
 	MasklengthRangeMax uint8
 	MasklengthRangeMin uint8
 }
 
 func (p *Prefix) Match(path *Path) bool {
-	rf := path.GetRouteFamily()
+	rf := path.GetFamily()
 	if rf != p.AddressFamily {
 		return false
 	}
@@ -351,7 +364,7 @@ func NewPrefix(c oc.Prefix) (*Prefix, error) {
 type PrefixSet struct {
 	name   string
 	tree   *critbitgo.Net
-	family bgp.RouteFamily
+	family bgp.Family
 }
 
 func (s *PrefixSet) Name() string {
@@ -474,7 +487,7 @@ func NewPrefixSetFromApiStruct(name string, prefixes []*Prefix) (*PrefixSet, err
 		return nil, fmt.Errorf("empty prefix set name")
 	}
 	tree := critbitgo.NewNet()
-	var family bgp.RouteFamily
+	var family bgp.Family
 	for i, x := range prefixes {
 		if i == 0 {
 			family = x.AddressFamily
@@ -505,7 +518,7 @@ func NewPrefixSet(c oc.PrefixSet) (*PrefixSet, error) {
 		return nil, fmt.Errorf("empty prefix set name")
 	}
 	tree := critbitgo.NewNet()
-	var family bgp.RouteFamily
+	var family bgp.Family
 	for i, x := range c.PrefixList {
 		y, err := NewPrefix(x)
 		if err != nil {
@@ -1446,8 +1459,8 @@ func (c *PrefixCondition) Option() MatchOption {
 // subsequent comparison is skipped if that matches the conditions.
 // If PrefixList's length is zero, return true.
 func (c *PrefixCondition) Evaluate(path *Path, _ *PolicyOptions) bool {
-	pathAfi, _ := bgp.RouteFamilyToAfiSafi(path.GetRouteFamily())
-	cAfi, _ := bgp.RouteFamilyToAfiSafi(c.set.family)
+	pathAfi, _ := bgp.FamilyToAfiSafi(path.GetFamily())
+	cAfi, _ := bgp.FamilyToAfiSafi(c.set.family)
 
 	if cAfi != pathAfi {
 		return false
@@ -2043,7 +2056,7 @@ func NewOriginCondition(origin oc.BgpOriginAttrType) (*OriginCondition, error) {
 }
 
 type AfiSafiInCondition struct {
-	routeFamilies []bgp.RouteFamily
+	routeFamilies []bgp.Family
 }
 
 func (c *AfiSafiInCondition) Type() ConditionType {
@@ -2052,7 +2065,7 @@ func (c *AfiSafiInCondition) Type() ConditionType {
 
 func (c *AfiSafiInCondition) Evaluate(path *Path, _ *PolicyOptions) bool {
 	for _, rf := range c.routeFamilies {
-		if path.GetRouteFamily() == rf {
+		if path.GetFamily() == rf {
 			return true
 		}
 	}
@@ -2078,12 +2091,12 @@ func NewAfiSafiInCondition(afiSafInConfig []oc.AfiSafiType) (*AfiSafiInCondition
 		return nil, nil
 	}
 
-	routeFamilies := make([]bgp.RouteFamily, 0, len(afiSafInConfig))
+	routeFamilies := make([]bgp.Family, 0, len(afiSafInConfig))
 	for _, afiSafiValue := range afiSafInConfig {
 		if err := afiSafiValue.Validate(); err != nil {
 			return nil, err
 		}
-		rf, err := bgp.GetRouteFamily(string(afiSafiValue))
+		rf, err := bgp.GetFamily(string(afiSafiValue))
 		if err != nil {
 			return nil, err
 		}
@@ -4080,6 +4093,19 @@ type PolicyAssignment struct {
 	Default  RouteType
 }
 
+func ToComparisonApi(c oc.AttributeComparison) api.Comparison {
+	switch c {
+	case oc.ATTRIBUTE_COMPARISON_ATTRIBUTE_EQ, oc.ATTRIBUTE_COMPARISON_EQ:
+		return api.Comparison_COMPARISON_EQ
+	case oc.ATTRIBUTE_COMPARISON_ATTRIBUTE_GE, oc.ATTRIBUTE_COMPARISON_GE:
+		return api.Comparison_COMPARISON_GE
+	case oc.ATTRIBUTE_COMPARISON_ATTRIBUTE_LE, oc.ATTRIBUTE_COMPARISON_LE:
+		return api.Comparison_COMPARISON_LE
+	default:
+		return api.Comparison_COMPARISON_EQ
+	}
+}
+
 var _regexpMedActionType = regexp.MustCompile(`([+-]?)(\d+)`)
 
 func toStatementApi(s *oc.Statement) *api.Statement {
@@ -4087,60 +4113,65 @@ func toStatementApi(s *oc.Statement) *api.Statement {
 	o, _ := NewMatchOption(s.Conditions.MatchPrefixSet.MatchSetOptions)
 	if s.Conditions.MatchPrefixSet.PrefixSet != "" {
 		cs.PrefixSet = &api.MatchSet{
-			Type: api.MatchSet_Type(o),
+			Type: o.ToApi(),
 			Name: s.Conditions.MatchPrefixSet.PrefixSet,
 		}
 	}
 	if s.Conditions.MatchNeighborSet.NeighborSet != "" {
 		o, _ := NewMatchOption(s.Conditions.MatchNeighborSet.MatchSetOptions)
 		cs.NeighborSet = &api.MatchSet{
-			Type: api.MatchSet_Type(o),
+			Type: o.ToApi(),
 			Name: s.Conditions.MatchNeighborSet.NeighborSet,
 		}
 	}
+
 	if s.Conditions.BgpConditions.CommunityCount.Operator != "" {
 		cs.CommunityCount = &api.CommunityCount{
 			Count: s.Conditions.BgpConditions.CommunityCount.Value,
-			Type:  api.CommunityCount_Type(s.Conditions.BgpConditions.CommunityCount.Operator.ToInt()),
+			Type:  ToComparisonApi(s.Conditions.BgpConditions.CommunityCount.Operator),
 		}
 	}
 	if s.Conditions.BgpConditions.OriginEq.ToInt() != -1 {
 		switch s.Actions.BgpActions.SetRouteOrigin {
 		case oc.BGP_ORIGIN_ATTR_TYPE_IGP:
-			cs.Origin = api.RouteOriginType_ORIGIN_IGP
+			cs.Origin = api.OriginType_ORIGIN_TYPE_IGP
 		case oc.BGP_ORIGIN_ATTR_TYPE_EGP:
-			cs.Origin = api.RouteOriginType_ORIGIN_EGP
+			cs.Origin = api.OriginType_ORIGIN_TYPE_EGP
 		case oc.BGP_ORIGIN_ATTR_TYPE_INCOMPLETE:
-			cs.Origin = api.RouteOriginType_ORIGIN_INCOMPLETE
+			cs.Origin = api.OriginType_ORIGIN_TYPE_INCOMPLETE
 		}
 	}
 	if s.Conditions.BgpConditions.AsPathLength.Operator != "" {
 		cs.AsPathLength = &api.AsPathLength{
 			Length: s.Conditions.BgpConditions.AsPathLength.Value,
-			Type:   api.AsPathLength_Type(s.Conditions.BgpConditions.AsPathLength.Operator.ToInt()),
+			Type:   ToComparisonApi(s.Conditions.BgpConditions.AsPathLength.Operator),
 		}
 	}
 	if s.Conditions.BgpConditions.MatchAsPathSet.AsPathSet != "" {
+		o, _ := NewMatchOption(s.Conditions.BgpConditions.MatchAsPathSet.MatchSetOptions)
 		cs.AsPathSet = &api.MatchSet{
-			Type: api.MatchSet_Type(s.Conditions.BgpConditions.MatchAsPathSet.MatchSetOptions.ToInt()),
+			Type: o.ToApi(),
 			Name: s.Conditions.BgpConditions.MatchAsPathSet.AsPathSet,
 		}
 	}
 	if s.Conditions.BgpConditions.MatchCommunitySet.CommunitySet != "" {
+		o, _ := NewMatchOption(s.Conditions.BgpConditions.MatchCommunitySet.MatchSetOptions)
 		cs.CommunitySet = &api.MatchSet{
-			Type: api.MatchSet_Type(s.Conditions.BgpConditions.MatchCommunitySet.MatchSetOptions.ToInt()),
+			Type: o.ToApi(),
 			Name: s.Conditions.BgpConditions.MatchCommunitySet.CommunitySet,
 		}
 	}
 	if s.Conditions.BgpConditions.MatchExtCommunitySet.ExtCommunitySet != "" {
+		o, _ := NewMatchOption(s.Conditions.BgpConditions.MatchExtCommunitySet.MatchSetOptions)
 		cs.ExtCommunitySet = &api.MatchSet{
-			Type: api.MatchSet_Type(s.Conditions.BgpConditions.MatchExtCommunitySet.MatchSetOptions.ToInt()),
+			Type: o.ToApi(),
 			Name: s.Conditions.BgpConditions.MatchExtCommunitySet.ExtCommunitySet,
 		}
 	}
 	if s.Conditions.BgpConditions.MatchLargeCommunitySet.LargeCommunitySet != "" {
+		o, _ := NewMatchOption(s.Conditions.BgpConditions.MatchLargeCommunitySet.MatchSetOptions)
 		cs.LargeCommunitySet = &api.MatchSet{
-			Type: api.MatchSet_Type(s.Conditions.BgpConditions.MatchLargeCommunitySet.MatchSetOptions.ToInt()),
+			Type: o.ToApi(),
 			Name: s.Conditions.BgpConditions.MatchLargeCommunitySet.LargeCommunitySet,
 		}
 	}
@@ -4154,29 +4185,53 @@ func toStatementApi(s *oc.Statement) *api.Statement {
 		afiSafiIn := make([]*api.Family, 0)
 		for _, afiSafiType := range s.Conditions.BgpConditions.AfiSafiInList {
 			if mapped, ok := bgp.AddressFamilyValueMap[string(afiSafiType)]; ok {
-				afi, safi := bgp.RouteFamilyToAfiSafi(mapped)
+				afi, safi := bgp.FamilyToAfiSafi(mapped)
 				afiSafiIn = append(afiSafiIn, &api.Family{Afi: api.Family_Afi(afi), Safi: api.Family_Safi(safi)})
 			}
 		}
 		cs.AfiSafiIn = afiSafiIn
 	}
-	cs.RpkiResult = int32(s.Conditions.BgpConditions.RpkiValidationResult.ToInt())
+	switch s.Conditions.BgpConditions.RpkiValidationResult {
+	case oc.RPKI_VALIDATION_RESULT_TYPE_NONE:
+		cs.RpkiResult = api.ValidationState_VALIDATION_STATE_NONE
+	case oc.RPKI_VALIDATION_RESULT_TYPE_NOT_FOUND:
+		cs.RpkiResult = api.ValidationState_VALIDATION_STATE_NOT_FOUND
+	case oc.RPKI_VALIDATION_RESULT_TYPE_VALID:
+		cs.RpkiResult = api.ValidationState_VALIDATION_STATE_VALID
+	case oc.RPKI_VALIDATION_RESULT_TYPE_INVALID:
+		cs.RpkiResult = api.ValidationState_VALIDATION_STATE_INVALID
+	}
+	community_action := func(action string) api.CommunityAction_Type {
+		fmt.Println("action0", action)
+		switch oc.BgpSetCommunityOptionType(action) {
+		case oc.BGP_SET_COMMUNITY_OPTION_TYPE_ADD:
+			fmt.Println("action1", action)
+			return api.CommunityAction_TYPE_ADD
+		case oc.BGP_SET_COMMUNITY_OPTION_TYPE_REMOVE:
+			fmt.Println("action2", action)
+			return api.CommunityAction_TYPE_REMOVE
+		case oc.BGP_SET_COMMUNITY_OPTION_TYPE_REPLACE:
+			fmt.Println("action3", action)
+			return api.CommunityAction_TYPE_REPLACE
+		}
+		return api.CommunityAction_TYPE_UNSPECIFIED
+	}
 	as := &api.Actions{
 		RouteAction: func() api.RouteAction {
 			switch s.Actions.RouteDisposition {
 			case oc.ROUTE_DISPOSITION_ACCEPT_ROUTE:
-				return api.RouteAction_ACCEPT
+				return api.RouteAction_ROUTE_ACTION_ACCEPT
 			case oc.ROUTE_DISPOSITION_REJECT_ROUTE:
-				return api.RouteAction_REJECT
+				return api.RouteAction_ROUTE_ACTION_REJECT
 			}
-			return api.RouteAction_NONE
+			return api.RouteAction_ROUTE_ACTION_UNSPECIFIED
 		}(),
 		Community: func() *api.CommunityAction {
 			if len(s.Actions.BgpActions.SetCommunity.SetCommunityMethod.CommunitiesList) == 0 {
 				return nil
 			}
 			return &api.CommunityAction{
-				Type:        api.CommunityAction_Type(oc.BgpSetCommunityOptionTypeToIntMap[oc.BgpSetCommunityOptionType(s.Actions.BgpActions.SetCommunity.Options)]),
+				Type:        community_action(s.Actions.BgpActions.SetCommunity.Options),
 				Communities: s.Actions.BgpActions.SetCommunity.SetCommunityMethod.CommunitiesList}
 		}(),
 		Med: func() *api.MedAction {
@@ -4188,10 +4243,10 @@ func toStatementApi(s *oc.Statement) *api.Statement {
 			if len(matches) == 0 {
 				return nil
 			}
-			action := api.MedAction_REPLACE
+			action := api.MedAction_TYPE_REPLACE
 			switch matches[1] {
 			case "+", "-":
-				action = api.MedAction_MOD
+				action = api.MedAction_TYPE_MOD
 			}
 			value, err := strconv.ParseInt(matches[1]+matches[2], 10, 64)
 			if err != nil {
@@ -4224,7 +4279,7 @@ func toStatementApi(s *oc.Statement) *api.Statement {
 				return nil
 			}
 			return &api.CommunityAction{
-				Type:        api.CommunityAction_Type(oc.BgpSetCommunityOptionTypeToIntMap[oc.BgpSetCommunityOptionType(s.Actions.BgpActions.SetExtCommunity.Options)]),
+				Type:        community_action(s.Actions.BgpActions.SetExtCommunity.Options),
 				Communities: s.Actions.BgpActions.SetExtCommunity.SetExtCommunityMethod.CommunitiesList,
 			}
 		}(),
@@ -4233,7 +4288,7 @@ func toStatementApi(s *oc.Statement) *api.Statement {
 				return nil
 			}
 			return &api.CommunityAction{
-				Type:        api.CommunityAction_Type(oc.BgpSetCommunityOptionTypeToIntMap[oc.BgpSetCommunityOptionType(s.Actions.BgpActions.SetLargeCommunity.Options)]),
+				Type:        community_action(string(s.Actions.BgpActions.SetLargeCommunity.Options)),
 				Communities: s.Actions.BgpActions.SetLargeCommunity.SetLargeCommunityMethod.CommunitiesList,
 			}
 		}(),
@@ -4270,14 +4325,14 @@ func toStatementApi(s *oc.Statement) *api.Statement {
 			if s.Actions.BgpActions.SetRouteOrigin.ToInt() == -1 {
 				return nil
 			}
-			var apiOrigin api.RouteOriginType
+			var apiOrigin api.OriginType
 			switch s.Actions.BgpActions.SetRouteOrigin {
 			case oc.BGP_ORIGIN_ATTR_TYPE_IGP:
-				apiOrigin = api.RouteOriginType_ORIGIN_IGP
+				apiOrigin = api.OriginType_ORIGIN_TYPE_IGP
 			case oc.BGP_ORIGIN_ATTR_TYPE_EGP:
-				apiOrigin = api.RouteOriginType_ORIGIN_EGP
+				apiOrigin = api.OriginType_ORIGIN_TYPE_EGP
 			case oc.BGP_ORIGIN_ATTR_TYPE_INCOMPLETE:
-				apiOrigin = api.RouteOriginType_ORIGIN_INCOMPLETE
+				apiOrigin = api.OriginType_ORIGIN_TYPE_INCOMPLETE
 			default:
 				return nil
 			}
@@ -4313,20 +4368,20 @@ func NewAPIPolicyAssignmentFromTableStruct(t *PolicyAssignment) *api.PolicyAssig
 		Direction: func() api.PolicyDirection {
 			switch t.Type {
 			case POLICY_DIRECTION_IMPORT:
-				return api.PolicyDirection_IMPORT
+				return api.PolicyDirection_POLICY_DIRECTION_IMPORT
 			case POLICY_DIRECTION_EXPORT:
-				return api.PolicyDirection_EXPORT
+				return api.PolicyDirection_POLICY_DIRECTION_EXPORT
 			}
-			return api.PolicyDirection_UNKNOWN
+			return api.PolicyDirection_POLICY_DIRECTION_UNSPECIFIED
 		}(),
 		DefaultAction: func() api.RouteAction {
 			switch t.Default {
 			case ROUTE_TYPE_ACCEPT:
-				return api.RouteAction_ACCEPT
+				return api.RouteAction_ROUTE_ACTION_ACCEPT
 			case ROUTE_TYPE_REJECT:
-				return api.RouteAction_REJECT
+				return api.RouteAction_ROUTE_ACTION_REJECT
 			}
-			return api.RouteAction_NONE
+			return api.RouteAction_ROUTE_ACTION_UNSPECIFIED
 		}(),
 		Name: t.Name,
 		Policies: func() []*api.Policy {

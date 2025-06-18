@@ -23,12 +23,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	api "github.com/osrg/gobgp/v3/api"
-	"github.com/osrg/gobgp/v3/internal/pkg/table"
-	"github.com/osrg/gobgp/v3/pkg/config/oc"
-	"github.com/osrg/gobgp/v3/pkg/log"
-	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
-	"github.com/osrg/gobgp/v3/pkg/packet/bmp"
+	"github.com/osrg/gobgp/v4/api"
+	"github.com/osrg/gobgp/v4/internal/pkg/table"
+	"github.com/osrg/gobgp/v4/pkg/config/oc"
+	"github.com/osrg/gobgp/v4/pkg/log"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
+	"github.com/osrg/gobgp/v4/pkg/packet/bmp"
 )
 
 type ribout map[string][]*table.Path
@@ -247,7 +247,7 @@ func (b *bmpClient) loop() {
 					var err error
 					b.s.ListPeer(context.Background(), &api.ListPeerRequest{EnableAdvertised: true},
 						func(peer *api.Peer) {
-							if err == nil && peer.State.SessionState == api.PeerState_ESTABLISHED {
+							if err == nil && peer.State.SessionState == api.PeerState_SESSION_STATE_ESTABLISHED {
 								err = write(bmpPeerStats(bmp.BMP_PEER_TYPE_GLOBAL, 0, time.Now().Unix(), peer))
 							}
 						})
